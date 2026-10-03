@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 from . import specctra
 
+
 def _mm(nm: float) -> str:
     return f'{nm / 1e6:.2f} mm'
 
@@ -42,6 +43,8 @@ def describe_keepouts(stats: Dict[str, int]) -> List[str]:
         lines.append(f"{stats['via_only']} rule area(s) keep out vias only (tracks allowed)")
     if stats.get('kept'):
         lines.append(f"{stats['kept']} rule area(s) keep out tracks and vias")
+    if stats.get('unmatched'):
+        lines.append(f"{stats['unmatched']} other keep-out(s) left as KiCad exported them")
     return lines
 
 
@@ -68,11 +71,13 @@ def progress_text(line: str) -> str:
 
 def summarize_result(result: specctra.RouteResult, export: Optional[specctra.ExportReport],
                      drc: Optional[specctra.DrcSummary], elapsed: float,
-                     drc_requested: bool) -> List[str]:
+                     drc_requested: bool, zones_refilled: bool = False) -> List[str]:
     lines = [f'Routing finished in {elapsed:.0f} s.']
     if result.unrouted is not None:
         lines.append(f'  Connections left unrouted: {result.unrouted}')
         lines.append(f'  Freerouting clearance violations: {result.violations}')
+    if zones_refilled:
+        lines.append('  Zones refilled.')
     if export is not None:
         rules = describe_class_rules(export.classes)
         if export.rules is not None:
@@ -83,17 +88,19 @@ def summarize_result(result: specctra.RouteResult, export: Optional[specctra.Exp
             else:
                 lines.append('Isolation: net-class clearances only (no custom rule '
                              'needs more between classes).')
+            for name, reason in export.rules.unsupported[:5]:
+                lines.append(f"  Rule '{name}' ignored: {reason}")
         ko = describe_keepouts(export.keepouts)
         if ko:
             lines.append('')
             lines.append('Rule areas:')
             lines += ['  ' + k for k in ko]
     lines.append('')
-    if drc is not None:
+    if drc is not None and not drc.error:
         between = sum(drc.between_parts.values())
         inside = sum(drc.inside_parts.values())
         area = sum(drc.rule_area.values())
-        lines.append("KiCad DRC (on a copy of the board):")
+        lines.append("KiCad DRC (on a copy of the board, with the project settings saved on disk):")
         lines.append(f'  Clearance / creepage violations: {between}')
         if inside:
             lines.append(f'  ... inside footprints (the part itself): {inside}')
@@ -101,9 +108,11 @@ def summarize_result(result: specctra.RouteResult, export: Optional[specctra.Exp
             lines.append(f'  ... against rule-area outlines (KiCad counts them as copper '
                          f'for creepage): {area}')
         lines.append(f'  Unconnected items: {drc.unconnected}')
+    elif drc is not None:
+        lines.append(f"KiCad's DRC could not be run: {drc.error}.")
+        lines.append('Run Inspect > Design Rules Checker to check the result.')
     elif drc_requested:
-        lines.append("KiCad DRC could not be run (kicad-cli not found); run Inspect > "
-                     "Design Rules Checker.")
+        lines.append("KiCad's DRC could not be run. Run Inspect > Design Rules Checker.")
     else:
         lines.append('Run Inspect > Design Rules Checker to check the result.')
     lines.append('Edit > Undo reverts the routing.')

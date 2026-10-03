@@ -244,36 +244,50 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
         if not any(len(fp.Pads()) for fp in board.GetFootprints()):
             wx.MessageBox('The board has no pads to route.', 'place-news', wx.OK | wx.ICON_WARNING)
             return
-        settings = load_route_settings()
         workdir = tempfile.mkdtemp(prefix='place-news-route-')
+        keep_workdir = False
+        try:
+            keep_workdir = self._run(board, workdir)
+        finally:
+            if not keep_workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+    def _run(self, board, workdir: str) -> bool:
+        """The routing flow. Returns True to keep the working files (shown to
+        the user for diagnosis)."""
+        settings = load_route_settings()
         name = _board_name(board)
         dsn = os.path.join(workdir, name + '.dsn')
         ses = os.path.join(workdir, name + '.ses')
 
         preview, preview_error = None, ''
+        busy = wx.BusyInfo('Reading the board and its design rules...')
         try:
             preview = specctra.export_dsn(board, dsn, use_isolation=True)
         except Exception as e:      # shown in the dialog
             preview_error = str(e)
+        finally:
+            del busy
 
         dlg = RouteDialog(None, board, settings, preview, preview_error)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
-            shutil.rmtree(workdir, ignore_errors=True)
-            return
+            return False
         values = dlg.values
         dlg.Destroy()
         settings.update(values)
         save_route_settings(settings)
 
-        try:
-            export = specctra.export_dsn(board, dsn, use_isolation=values['use_isolation'])
-        except Exception as e:
-            wx.MessageBox(f'Specctra export failed:\n{e}', 'place-news', wx.OK | wx.ICON_ERROR)
-            return
+        export = preview
+        if export is None or not values['use_isolation']:
+            try:
+                export = specctra.export_dsn(board, dsn, use_isolation=values['use_isolation'])
+            except Exception as e:
+                wx.MessageBox(f'Specctra export failed:\n{e}', 'place-news', wx.OK | wx.ICON_ERROR)
+                return False
 
         progress = wx.ProgressDialog(
-            'place-news — Routing', 'Starting Freerouting...', maximum=100, parent=None,
+            'place-news \u2014 Routing', 'Starting Freerouting...', maximum=100, parent=None,
             style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT | wx.PD_ELAPSED_TIME | wx.PD_SMOOTH)
 
         def poll(line: str, _elapsed: float) -> bool:
@@ -285,31 +299,41 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
             result = specctra.run_freerouting(values['java'], values['jar'], dsn, ses,
                                               passes=values['passes'], poll=poll)
         except Exception as e:
-            progress.Destroy()
             wx.MessageBox(f'Freerouting could not be started:\n{e}', 'place-news',
                           wx.OK | wx.ICON_ERROR)
-            return
-        progress.Destroy()
+            return False
+        finally:
+            progress.Destroy()
         elapsed = time.time() - start
 
+        if result.timed_out:
+            wx.MessageBox('Freerouting did not finish within the time limit; the board was not '
+                          'changed.', 'place-news', wx.OK | wx.ICON_WARNING)
+            return False
         if result.cancelled:
             wx.MessageBox('Routing cancelled; the board was not changed.', 'place-news',
                           wx.OK | wx.ICON_INFORMATION)
-            return
+            return False
         if not result.ok:
-            tail = result.log[-15:]
             dlg = RouteResultDialog(None, ['Freerouting did not produce a result '
                                            f'(exit code {result.returncode}).', '',
-                                           f'Working files: {workdir}', ''] + tail, ok=False)
+                                           f'Working files: {workdir}', ''] + result.log[-15:],
+                                    ok=False)
             dlg.ShowModal()
             dlg.Destroy()
-            return
+            return True
 
+        refill = any(z.IsFilled() for z in board.Zones() if not z.GetIsRuleArea())
         if not safe_import_ses(board, ses):
-            wx.MessageBox(f'KiCad could not import the routing session:\n{ses}\n\n'
-                          f'Edit > Undo restores the previous tracks.', 'place-news',
-                          wx.OK | wx.ICON_ERROR)
-            return
+            wx.MessageBox(f'KiCad could not import the routing session.\n\n'
+                          f'Edit > Undo restores the previous tracks.\nWorking files: {workdir}',
+                          'place-news', wx.OK | wx.ICON_ERROR)
+            return True
+        if refill:
+            try:
+                pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+            except Exception:
+                refill = False
 
         drc = None
         if values['check_drc']:
@@ -317,13 +341,14 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
             try:
                 drc = specctra.drc_summary(board, specctra.find_kicad_cli(),
                                            workdir=os.path.join(workdir, 'drc'))
-            except Exception:
-                drc = None
+            except Exception as e:
+                drc = specctra.DrcSummary(error=str(e))
             finally:
                 del busy
 
-        lines = summarize_result(result, export, drc, elapsed, values['check_drc'])
+        lines = summarize_result(result, export, drc, elapsed, values['check_drc'],
+                                 zones_refilled=refill)
         dlg = RouteResultDialog(None, lines)
         dlg.ShowModal()
         dlg.Destroy()
-        shutil.rmtree(workdir, ignore_errors=True)
+        return False

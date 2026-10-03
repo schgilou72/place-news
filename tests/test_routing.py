@@ -6,11 +6,13 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from plugin.rules import PadInfo, parse_rules, compile_condition, track_item, via_item  # noqa: E402
+from plugin.rules import (PadInfo, parse_rules, compile_condition, track_item, via_item,  # noqa: E402
+                          set_board_layers)
+from plugin.isolation import build_isolation_model, list_violations  # noqa: E402
 from plugin import specctra  # noqa: E402
 from plugin.specctra import (NetRouteInfo, RuleAreaInfo, apply_isolation_classes,  # noqa: E402
                              fix_rule_area_keepouts, parse_dsn, write_dsn, _find, _find_all,
-                             _drop_section)
+                             _drop_section, NO_NET)
 from plugin.route_report import (class_label, describe_class_rules, progress_text,  # noqa: E402
                                  summarize_result)
 
@@ -33,7 +35,7 @@ DSN = '''(pcb /tmp/x.dsn
     (layer B.Cu (type signal) (property (index 1)))
     (boundary (path pcb 0  0 0  100000 0  100000 -60000  0 -60000  0 0))
     (keepout "" (polygon F.Cu 0  66000 -2000  98000 -2000  98000 -58000  66000 -58000  66000 -2000))
-    (keepout "" (polygon B.Cu 0  0 0  9000 0  9000 -9000  0 -9000  0 0))
+    (wire_keepout "" (polygon B.Cu 0  0 0  9000 0  9000 -9000  0 -9000  0 0))
     (keepout "" (polygon F.Cu 0  10000 -10000  20000 -10000  20000 -20000  10000 -20000  10000 -10000))
     (via "Via[0-1]_600:300_um")
     (rule
@@ -173,6 +175,23 @@ class TestDsn(unittest.TestCase):
         self.assertEqual(len(_find_all(structure, 'keepout')), 1)
         self.assertEqual(len(_find_all(structure, 'wire_keepout')), 1)
 
+    def test_same_outline_areas_keep_their_own_keepout(self):
+        # A placement area and a "no tracks" area with the same outline: KiCad
+        # writes a keepout and a wire_keepout; only the first one goes.
+        tree = parse_dsn(DSN.replace(
+            '(via "Via[0-1]_600:300_um")',
+            '(wire_keepout "" (polygon F.Cu 0  66000 -2000  98000 -2000  98000 -58000  66000 -58000'
+            '  66000 -2000))\n    (via "Via[0-1]_600:300_um")'))
+        box = (66 * MM, 2 * MM, 98 * MM, 58 * MM)
+        areas = [RuleAreaInfo(('F.Cu',), box, False, False, 'PLACEMENT'),
+                 RuleAreaInfo(('F.Cu',), box, True, False, 'NO_TRACKS')]
+        stats = fix_rule_area_keepouts(tree, areas)
+        self.assertEqual(stats['removed'], 1)
+        self.assertEqual(stats['wire_only'], 1)
+        structure = _find(tree, 'structure')
+        wk = _find_all(structure, 'wire_keepout')
+        self.assertTrue(any(w[2][1] == 'F.Cu' for w in wk))
+
     def test_isolation_classes(self):
         tree = parse_dsn(DSN)
         rules = parse_rules(CREEPAGE)
@@ -218,6 +237,101 @@ class TestDsn(unittest.TestCase):
         self.assertNotIn('placement', out)
         self.assertIn('(routes', out)
         self.assertEqual(out.count('('), out.count(')'))
+
+
+class TestLayers(unittest.TestCase):
+    def tearDown(self):
+        set_board_layers(('F.Cu', 'B.Cu'))
+
+    def ev(self, src, a, b):
+        fn, _ = compile_condition(src)
+        return bool(fn(a, b))
+
+    def test_wildcards_in_rules_match_item_layers(self):
+        set_board_layers(('F.Cu', 'In1.Cu', 'In2.Cu', 'B.Cu'))
+        t = track_item('X', ('Default',), 0, 'F.Cu')
+        tht = PadInfo(pad_type='tht', layers=('*.Cu',))
+        self.assertTrue(self.ev("A.Layer == '?.Cu'", t, LV))
+        self.assertFalse(self.ev("A.existsOnLayer('In*.Cu')", t, LV))
+        self.assertTrue(self.ev("A.existsOnLayer('In*.Cu')", tht, LV))
+        self.assertFalse(self.ev("A.Layer == 'f.cu'", t, LV))         # case-sensitive, as KiCad
+
+    def test_user_layer_names(self):
+        set_board_layers(('F.Cu', 'B.Cu'), {'Top': 'F.Cu'})
+        self.assertTrue(self.ev("A.Layer == 'Top'", track_item('X', ('Default',), 0, 'F.Cu'), LV))
+        self.assertFalse(self.ev("A.Layer == 'Top'", track_item('X', ('Default',), 0, 'B.Cu'), LV))
+
+    def test_layer_clause_limits_a_rule_to_its_layers(self):
+        text = ('(version 1)\n'
+                '(rule "general" (constraint clearance (min 2mm)))\n'
+                '(rule "inner relaxed" (layer inner) (constraint clearance (min 0.1mm)))')
+        two = parse_rules(text, copper_layers=('F.Cu', 'B.Cu'))
+        self.assertEqual(two.requirement(HV, LV), 2 * MM)              # outer layers only
+        four = parse_rules(text, copper_layers=('F.Cu', 'In1.Cu', 'In2.Cu', 'B.Cu'))
+        inner_a = track_item('A', ('Default',), 0, 'In1.Cu')
+        inner_b = track_item('B', ('Default',), 0, 'In1.Cu')
+        self.assertEqual(four.requirement(inner_a, inner_b), 100_000)
+        # Through-hole items meet on every layer: the outer layers decide.
+        tht_a = PadInfo(net_name='A', pad_type='tht', layers=('*.Cu',))
+        tht_b = PadInfo(net_name='B', pad_type='tht', layers=('*.Cu',))
+        self.assertEqual(four.requirement(tht_a, tht_b), 2 * MM)
+
+
+class TestNetSignatures(unittest.TestCase):
+    def test_nets_grouped_by_the_names_rules_mention(self):
+        rs = parse_rules('(version 1)\n(rule "bus" (constraint clearance (min 3mm)) '
+                         '(condition "A.NetName == \'HV_*\'"))')
+        self.assertEqual(rs.netname_literals, frozenset({('HV_*', True)}))
+        canon = rs.net_canonicalizer()
+        self.assertEqual(canon('HV_A'), canon('HV_B'))
+        self.assertNotEqual(canon('HV_A'), canon('LV'))
+        self.assertEqual(canon('LV'), canon('GND'))
+
+    def test_other_netname_uses_keep_nets_apart(self):
+        rs = parse_rules('(version 1)\n(rule "x" (constraint clearance (min 3mm)) '
+                         '(condition "A.NetName == B.NetName"))')
+        self.assertIsNone(rs.netname_literals)
+        canon = rs.net_canonicalizer()
+        self.assertNotEqual(canon('LV'), canon('GND'))
+
+
+class TestNetlessItems(unittest.TestCase):
+    def test_pads_without_net_get_isolation_in_the_router(self):
+        # Every net is HV; only unconnected pins sit in the default class.
+        tree = parse_dsn(DSN.replace('(class kicad_default GND LV', '(class kicad_default'))
+        nets = {k: v for k, v in nets_for().items() if k.startswith('HV')}
+        nets[NO_NET] = NetRouteInfo(NO_NET, ('Default',), 200_000,
+                                    {PadInfo(netclasses=('Default',), nc_clearance=200_000)},
+                                    routable=False)
+        rules = parse_rules('(version 1)\n(rule "HV clearance" (constraint clearance (min 4mm))\n'
+                            '  (condition "A.hasNetclass(\'HV\') && !B.hasNetclass(\'HV\')"))')
+        rep = apply_isolation_classes(tree, nets, rules)
+        self.assertEqual(rep.pairs, {('kicad_default', 'HV,Default'): 4 * MM})
+
+    def test_no_creepage_between_two_holes(self):
+        # KiCad never tests creepage between two items without net.
+        from plugin.board_model import Footprint, Pad
+        rules = parse_rules('(version 1) (rule "c" (constraint creepage (min 3mm)))')
+        hole = PadInfo(net_name='', pad_type='npth', layers=('*.Cu',))
+        fp = Footprint(reference='J1', index=0, x=10 * MM, y=10 * MM, angle_deg=0.0,
+                       width=8 * MM, height=4 * MM, locked=False, uuid='u0',
+                       pads=[Pad(net_code=0, net_name='', offset_x=-MM, offset_y=0),
+                             Pad(net_code=0, net_name='', offset_x=MM, offset_y=0)])
+        iso = build_isolation_model([(0, 0, 0, hole, -MM, 0, 500_000, 500_000),
+                                     (0, 1, 0, hole, MM, 0, 500_000, 500_000)], rules, 100_000)
+        self.assertEqual(list_violations(iso, [fp]), [])
+
+
+class TestDrcGuards(unittest.TestCase):
+    def test_unsaved_board_is_not_checked(self):
+        class Board:
+            def GetFileName(self):
+                return ''
+        d = specctra.drc_summary(Board(), '/usr/bin/kicad-cli')
+        self.assertIn('never been saved', d.error)
+        text = '\n'.join(summarize_result(specctra.RouteResult(ok=True, ses='', log=[]),
+                                          None, d, 1.0, True))
+        self.assertIn('never been saved', text)
 
 
 class TestReport(unittest.TestCase):

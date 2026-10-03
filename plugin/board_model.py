@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Set, Optional, FrozenSet
 
-from .rules import PadInfo, RuleSet, copper_layer_names, load_rules_file
+from .rules import PadInfo, RuleSet, copper_layer_names, load_rules_file, set_board_layers
 from .isolation import IsolationModel, build_isolation_model
 
 
@@ -361,15 +361,32 @@ def board_copper_layers(board) -> Tuple[str, ...]:
         return copper_layer_names(2)
 
 
+def board_layer_aliases(board) -> Dict[str, str]:
+    """User names of renamed copper layers -> canonical names."""
+    import pcbnew
+    out: Dict[str, str] = {}
+    try:
+        for lid in board.GetEnabledLayers().CuStack():
+            user = str(board.GetLayerName(lid))
+            canon = str(pcbnew.BOARD.GetStandardLayerName(lid))
+            if user and user != canon:
+                out[user] = canon
+    except Exception:
+        pass
+    return out
+
+
 def load_board_rules(board) -> RuleSet:
     """Custom rules of the board's project, with its minimum clearance and
-    copper layers."""
+    copper layers (also registered for layer matching in rule conditions)."""
     try:
         min_clr = int(board.GetDesignSettings().m_MinClearance)
     except Exception:
         min_clr = 0
+    layers = board_copper_layers(board)
+    set_board_layers(layers, board_layer_aliases(board))
     return load_rules_file(_rules_path(board), board_min_clearance=min_clr,
-                           copper_layers=board_copper_layers(board))
+                           copper_layers=layers)
 
 
 def _component_classes(fp) -> Tuple[str, ...]:

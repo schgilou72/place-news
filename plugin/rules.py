@@ -156,13 +156,37 @@ class PadInfo:
     def in_footprint(self) -> bool:
         return self.kind == 'pad'
 
-    def on_layer(self, layer: str) -> bool:
+    def on_layer(self, pattern: str) -> bool:
+        """Is the item on a copper layer matching `pattern` (a layer name or
+        wildcard, canonical or user name, as written in a rule)?"""
         if '*.Cu' in self.layers:
-            return layer.endswith('.Cu') or layer in ('*.Cu', '*')
-        return any(_wild_eq(layer, l) for l in self.layers)
+            return any(layer_matches(l, pattern) for l in _BOARD_LAYERS['copper'])
+        return any(layer_matches(l, pattern) for l in self.layers)
 
 
 ItemInfo = PadInfo
+
+# Copper layers of the board being processed and the user names of its layers
+# (KiCad matches layer names in rules against canonical and user names).
+_BOARD_LAYERS: Dict[str, Any] = {'copper': ('F.Cu', 'B.Cu'), 'aliases': {}}
+
+
+def set_board_layers(copper: Sequence[str], aliases: Optional[Dict[str, str]] = None) -> None:
+    """copper: canonical names (F.Cu, In1.Cu.., B.Cu); aliases: user name ->
+    canonical name for renamed layers."""
+    _BOARD_LAYERS['copper'] = tuple(copper) or ('F.Cu', 'B.Cu')
+    _BOARD_LAYERS['aliases'] = dict(aliases or {})
+
+
+def layer_matches(canonical: str, pattern: str) -> bool:
+    """KiCad layer matching (wxString::Matches, case-sensitive, '*' and '?'):
+    against the canonical name or the user name of the layer."""
+    if canonical == pattern or _wx_match(canonical, pattern):
+        return True
+    for user, canon in _BOARD_LAYERS['aliases'].items():
+        if canon == canonical and _wx_match(user, pattern):
+            return True
+    return False
 
 
 def track_item(net_name: str, netclasses: Tuple[str, ...], nc_clearance: int,
@@ -331,6 +355,10 @@ class _Parser:
         self.toks = tokens
         self.i = 0
         self.attrs: set = set()
+        # NetName used only as "A.NetName == 'literal'" lets nets be grouped
+        # by which literals they match (see RuleSet.net_signature).
+        self.netname_uses = 0
+        self.netname_literals: set = set()     # (literal, wildcards allowed)
 
     def peek(self) -> Optional[Tuple[str, str]]:
         return self.toks[self.i] if self.i < len(self.toks) else None
@@ -382,6 +410,14 @@ class _Parser:
             right = self.parse_unary()
             if op not in ('==', '!='):
                 raise UnsupportedRule(f"numeric comparison '{op}' is not supported")
+            lmeta = getattr(left, '_meta', None)
+            rmeta = getattr(right, '_meta', None)
+            if lmeta == 'NetName' and isinstance(rmeta, _Lit):
+                self.netname_literals.add((str(rmeta), True))
+                self.netname_uses -= 1
+            elif rmeta == 'NetName' and isinstance(lmeta, _Lit):
+                self.netname_literals.add((str(lmeta), False))
+                self.netname_uses -= 1
             if op == '==':
                 return lambda a, b: _equals(left(a, b), right(a, b)) is True
             return lambda a, b: _equals(left(a, b), right(a, b)) is False
@@ -406,7 +442,9 @@ class _Parser:
         if kind == 'str':
             self.i += 1
             s = _Lit(val.replace("\\'", "'"))
-            return lambda a, b: s
+            fn = lambda a, b: s  # noqa: E731
+            fn._meta = s
+            return fn
         if kind == 'num':
             raise UnsupportedRule("numeric values in conditions are not supported")
         if kind == 'ident':
@@ -442,7 +480,10 @@ class _Parser:
         if name == 'NetClass':
             return lambda a, b: _NetClassValue(pick(a, b).netclasses)
         if name == 'NetName':
-            return lambda a, b: pick(a, b).net_name
+            self.netname_uses += 1
+            fn = lambda a, b: pick(a, b).net_name  # noqa: E731
+            fn._meta = 'NetName'
+            return fn
         if name == 'Type':
             return lambda a, b: _TYPE_LABEL.get(pick(a, b).kind, 'Pad')
         if name == 'Pad_Type':
@@ -553,12 +594,20 @@ def _equals(x: Any, y: Any) -> Optional[bool]:
 
 def compile_condition(src: str) -> Tuple[Evaluator, FrozenSet[str]]:
     """Compile a KiCad rule condition. Returns (evaluator, attributes used)."""
+    ev, attrs, _names = _compile(src)
+    return ev, attrs
+
+
+def _compile(src: str) -> Tuple[Evaluator, FrozenSet[str], Optional[FrozenSet[Tuple[str, bool]]]]:
+    """(evaluator, attributes used, NetName literals or None when NetName is
+    used in another way than compared with a literal)."""
     src = (src or '').strip()
     if not src:
-        return (lambda a, b: True), frozenset()
+        return (lambda a, b: True), frozenset(), frozenset()
     parser = _Parser(_tokenize_expr(src))
     ev = parser.parse()
-    return ev, frozenset(parser.attrs)
+    names = frozenset(parser.netname_literals) if parser.netname_uses == 0 else None
+    return ev, frozenset(parser.attrs), names
 
 
 # ---------------------------------------------------------------------------
@@ -575,9 +624,21 @@ class Rule:
     constraints: Dict[str, Optional[int]]      # type -> min (nm); None if severity ignore
     evaluator: Evaluator = field(repr=False, default=lambda a, b: True)
     attrs: FrozenSet[str] = frozenset()
+    layer: str = ''                            # (layer ...) clause: '', 'outer', 'inner' or a name
+    netname_literals: Optional[FrozenSet[Tuple[str, bool]]] = frozenset()
 
     def matches(self, a: PadInfo, b: PadInfo) -> bool:
         return _truth(self.evaluator(a, b)) or _truth(self.evaluator(b, a))
+
+    def applies_on(self, layer: Optional[str]) -> bool:
+        """KiCad only applies a rule with a (layer ...) clause on those layers."""
+        if not self.layer or layer is None:
+            return True
+        if self.layer == 'outer':
+            return layer in ('F.Cu', 'B.Cu')
+        if self.layer == 'inner':
+            return layer.startswith('In') and layer.endswith('.Cu')
+        return layer_matches(layer, self.layer)
 
 
 DEFAULT_COPPER_LAYERS = ('F.Cu', 'B.Cu')
@@ -611,12 +672,50 @@ class RuleSet:
     def has_creepage(self) -> bool:
         return any('creepage' in r.constraints for r in self.rules)
 
-    def _lookup(self, a: PadInfo, b: PadInfo, types: Sequence[str]) -> Dict[str, Optional[int]]:
+    @property
+    def layer_sensitive(self) -> bool:
+        return any(r.layer for r in self.rules)
+
+    @property
+    def netname_literals(self) -> Optional[FrozenSet[Tuple[str, bool]]]:
+        """Every literal NetName is compared with, or None when some rule uses
+        NetName otherwise (then each net has to be evaluated on its own)."""
+        out: set = set()
+        for r in self.rules:
+            if r.netname_literals is None:
+                return None
+            out |= r.netname_literals
+        return frozenset(out)
+
+    def net_signature(self, name: str) -> Any:
+        """Nets with the same signature are indistinguishable for the rules."""
+        if 'net_name' not in self.attrs:
+            return ()
+        lits = self.netname_literals
+        if lits is None:
+            return name
+        return tuple((_wx_match(name, lit, case_sensitive=False) if wild and _has_wild(lit)
+                      else name.lower() == lit.lower()) for lit, wild in sorted(lits))
+
+    def net_canonicalizer(self) -> Callable[[str], str]:
+        """Maps a net name to a representative name with the same signature,
+        so equivalent nets share rule evaluations."""
+        reps: Dict[Any, str] = {}
+
+        def canon(name: str) -> str:
+            if 'net_name' not in self.attrs:
+                return ''
+            sig = self.net_signature(name)
+            return reps.setdefault(sig, name)
+        return canon
+
+    def _lookup(self, a: PadInfo, b: PadInfo, types: Sequence[str],
+                layer: Optional[str] = None) -> Dict[str, Optional[int]]:
         """Last matching rule per constraint type (None = severity ignore)."""
         found: Dict[str, Optional[int]] = {}
         for rule in reversed(self.rules):
             pending = [c for c in rule.constraints if c in types and c not in found]
-            if not pending:
+            if not pending or not rule.applies_on(layer):
                 continue
             if rule.matches(a, b):
                 for c in pending:
@@ -625,10 +724,23 @@ class RuleSet:
                     break
         return found
 
+    def _layers_of(self, item: PadInfo) -> Tuple[str, ...]:
+        if '*.Cu' in item.layers:
+            return tuple(self.copper_layers or DEFAULT_COPPER_LAYERS)
+        return item.layers
+
     def clearance(self, a: PadInfo, b: PadInfo) -> int:
         """Clearance (and physical clearance) KiCad applies between two items
-        of different nets."""
-        found = self._lookup(a, b, ('clearance', 'physical_clearance'))
+        of different nets; with layer-specific rules, the worst layer the two
+        items share (or any of their layers if they share none)."""
+        if not self.layer_sensitive:
+            return self._clearance_on(a, b, None)
+        la, lb = self._layers_of(a), self._layers_of(b)
+        layers = [l for l in la if l in lb] or list(dict.fromkeys(la + lb))
+        return max(self._clearance_on(a, b, l) for l in layers)
+
+    def _clearance_on(self, a: PadInfo, b: PadInfo, layer: Optional[str]) -> int:
+        found = self._lookup(a, b, ('clearance', 'physical_clearance'), layer)
         if 'clearance' in found:
             clearance = found['clearance'] or 0
         else:
@@ -647,7 +759,7 @@ class RuleSet:
             return cached
         best = 0
         for layer in self.copper_layers or DEFAULT_COPPER_LAYERS:
-            found = self._lookup(net_view(a, layer), net_view(b, layer), ('creepage',))
+            found = self._lookup(net_view(a, layer), net_view(b, layer), ('creepage',), layer)
             best = max(best, found.get('creepage') or 0)
         self._creepage_cache[key] = best
         return best
@@ -688,6 +800,7 @@ def parse_rules(text: str, board_min_clearance: int = 0, source: str = '',
         name = str(node[1]) if len(node) > 1 else '?'
         condition = ''
         severity = ''
+        layer = ''
         constraints: Dict[str, Optional[int]] = {}
         try:
             for item in node[2:]:
@@ -696,6 +809,8 @@ def parse_rules(text: str, board_min_clearance: int = 0, source: str = '',
                 head = item[0]
                 if head == 'condition' and len(item) > 1:
                     condition = str(item[1])
+                elif head == 'layer' and len(item) > 1:
+                    layer = str(item[1])
                 elif head == 'severity' and len(item) > 1:
                     severity = str(item[1]).lower()
                 elif head == 'constraint' and len(item) > 1:
@@ -717,12 +832,12 @@ def parse_rules(text: str, board_min_clearance: int = 0, source: str = '',
         if severity == 'ignore':
             constraints = {c: None for c in constraints}
         try:
-            ev, attrs = compile_condition(condition)
+            ev, attrs, names = _compile(condition)
         except UnsupportedRule as e:
             rs.unsupported.append((name, str(e)))
             continue
         rs.rules.append(Rule(name=name, condition=condition, constraints=constraints,
-                             evaluator=ev, attrs=attrs))
+                             evaluator=ev, attrs=attrs, layer=layer, netname_literals=names))
     return rs
 
 
