@@ -4,7 +4,7 @@ Derived from CadMust-Neo by Remi Blokker (MIT licence).
 """
 import os
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 if not os.environ.get('PLACE_NEWS_NO_REGISTER'):
     try:
