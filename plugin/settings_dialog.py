@@ -46,6 +46,7 @@ _DEFAULTS: Dict[str, Any] = {
     "move_selected_only": False,
     "use_isolation": True,
     "exclusive_areas": True,
+    "align_rows": True,
 }
 
 
@@ -175,6 +176,19 @@ class SettingsDialog(wx.Dialog):
         )
         main_sizer.Add(self._chk_selected_only, 0,
                        wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        # --- Layout tidy-up ---
+        self._chk_align = wx.CheckBox(
+            self, label="Align parts of the same type in rows / columns")
+        self._chk_align.SetToolTip(
+            "After optimizing, parts with the same footprint and orientation that sit\n"
+            "roughly in a row (or a column) are put on one line through their centres\n"
+            "and evenly spaced. A move is kept only if no rule gets worse (overlap,\n"
+            "isolation, keep-outs, placement areas, board edge) and the wirelength\n"
+            "grows by 3 % at most.\n"
+            "References are then centred on their parts, horizontal or reading\n"
+            "bottom to top, and kept off the pads.")
+        main_sizer.Add(self._chk_align, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         # --- Design rules: isolation, placement areas ---
         bi = self._board_info or {}
@@ -460,6 +474,7 @@ class SettingsDialog(wx.Dialog):
         self._chk_selected_only.SetValue(bool(s.get("move_selected_only", False)))
         self._chk_isolation.SetValue(bool(s.get("use_isolation", True)))
         self._chk_exclusive.SetValue(bool(s.get("exclusive_areas", True)))
+        self._chk_align.SetValue(bool(s.get("align_rows", True)))
 
     def _on_preset_change(self, evt):
         """When preset changes in Expert mode, update the parameter controls."""
@@ -566,6 +581,7 @@ class SettingsDialog(wx.Dialog):
             config.cooling_slow = self._spin_cool_slow.GetValue()
             config.penalty_scale_min = self._spin_penalty_scale.GetValue()
             config.num_starts = self._spin_num_starts.GetValue()
+        config.align_rows = self._chk_align.GetValue()
         return config
 
     def _on_ok(self, evt):
@@ -585,6 +601,7 @@ class SettingsDialog(wx.Dialog):
             "move_selected_only": self._chk_selected_only.GetValue(),
             "use_isolation": self._chk_isolation.GetValue(),
             "exclusive_areas": self._chk_exclusive.GetValue(),
+            "align_rows": self._chk_align.GetValue(),
         }
         save_settings(data)
         self.EndModal(wx.ID_OK)

@@ -95,6 +95,7 @@ class Footprint:
     sheet: str = ''            # hierarchical sheet path, e.g. "/Power/"
     component_classes: Tuple[str, ...] = ()
     groups: Tuple[str, ...] = ()   # names of the enclosing groups, innermost first
+    lib_id: str = ''               # footprint library id, e.g. 'Resistor_SMD:R_0805_2012Metric'
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -702,6 +703,7 @@ def extract_board_model(board, selected_only: bool = False,
             sheet=sheet,
             component_classes=classes,
             groups=groups,
+            lib_id=lib_id,
         )
         footprints.append(f)
 

@@ -53,8 +53,24 @@ and run both actions.
    areas with *Placement* enabled (sheet, component class or group) keep their
    parts inside — and, with *Exclusive placement areas*, other parts outside.
 3. Click **place-news**, choose a preset, **Optimize**.
-4. The result dialog lists wirelength, overlaps, isolation, placement areas and
-   keep-outs. *Edit → Undo* restores the previous placement.
+4. The result dialog lists wirelength, overlaps, isolation, placement areas,
+   keep-outs, alignment and silkscreen. *Reject* (or *Edit → Undo*) restores the
+   previous placement.
+
+### Tidy layout
+
+- **Rows and columns** (*Align parts of the same type in rows / columns*, on by
+  default): parts with the same footprint and orientation that sit roughly in
+  a row or a column are put on one line through their centres, and lines of
+  three or more are evenly spaced. A locked part of the same type serves as
+  the anchor. A move is kept only if no rule gets worse (overlap, isolation,
+  keep-outs, placement areas, board edge) and the wirelength grows by 3 % at
+  most.
+- **Readable references**: each reference is centred on its part, horizontal
+  or vertical reading bottom to top (never upside down nor top to bottom),
+  along the long side of the part. It never touches a pad or another
+  reference: when pads take the centre, it goes beside the part, centred on
+  its axis. References of locked parts are left alone.
 
 ### Isolation during placement
 

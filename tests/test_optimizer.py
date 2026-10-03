@@ -393,7 +393,7 @@ class TestRadarAfe(unittest.TestCase):
                                msg="SA should keep components inside boundary")
 
 
-def make_silk_model(texts, fp_bboxes, keepouts=None, board_bbox=None):
+def make_silk_model(texts, fp_bboxes, keepouts=None, board_bbox=None, pads=None, fixed=None):
     """Helper to build a SilkscreenModel for testing."""
     if keepouts is None:
         keepouts = []
@@ -402,7 +402,14 @@ def make_silk_model(texts, fp_bboxes, keepouts=None, board_bbox=None):
     return SilkscreenModel(
         texts=texts, fp_bboxes=fp_bboxes,
         keepouts=keepouts, board_bbox=board_bbox,
+        pad_boxes={'F': list(pads or [])}, fixed_texts=list(fixed or []),
     )
+
+
+def result_box(text, res):
+    from plugin.silkscreen import _candidate_bbox
+    w, h = text.size(res[2])
+    return _candidate_bbox(res[0], res[1], w, h)
 
 
 class TestSilkscreen(unittest.TestCase):
@@ -412,22 +419,49 @@ class TestSilkscreen(unittest.TestCase):
         result = place_silkscreen(model)
         self.assertEqual(result, [])
 
-    def test_no_collision_keeps_position(self):
-        """Text already in a clear area — should stay at original position."""
-        # Footprint at center, text above it, nothing else nearby
+    def test_reference_centred_on_its_part(self):
+        """Nothing in the way: the reference sits in the middle of the part."""
         fp_bbox = (40*MM, 40*MM, 50*MM, 50*MM)
         text = TextRect(fp_index=0, cx=45*MM, cy=38*MM,
                         width=4*MM, height=1*MM)
         model = make_silk_model(texts=[text], fp_bboxes=[fp_bbox])
-        result = place_silkscreen(model)
-        # The text was already clear, but the algorithm always picks
-        # the best candidate. The top candidate would be very close to
-        # the original. Either way, no collision.
-        cx, cy = result[0]
-        # Verify the result doesn't collide with the footprint
-        from plugin.silkscreen import _overlaps, _candidate_bbox
-        cbox = _candidate_bbox(cx, cy, text.width, text.height)
-        self.assertFalse(_overlaps(cbox, fp_bbox))
+        self.assertEqual(place_silkscreen(model)[0], (45*MM, 45*MM, 0))
+
+    def test_tall_part_gets_vertical_text_reading_bottom_to_top(self):
+        fp_bbox = (10*MM, 10*MM, 14*MM, 30*MM)
+        text = TextRect(fp_index=0, cx=0, cy=0, width=4*MM, height=1*MM, angle=0)
+        model = make_silk_model(texts=[text], fp_bboxes=[fp_bbox])
+        self.assertEqual(place_silkscreen(model)[0], (12*MM, 20*MM, 90))
+
+    def test_pads_push_the_reference_beside_centred_on_axis(self):
+        """A pad under the centre: the reference goes above, centred on x."""
+        fp_bbox = (10*MM, 10*MM, 20*MM, 14*MM)
+        pads = [(13*MM, 11*MM, 17*MM, 13*MM), (10*MM, 10*MM, 12*MM, 14*MM)]
+        text = TextRect(fp_index=0, cx=0, cy=0, width=4*MM, height=1*MM)
+        model = make_silk_model(texts=[text], fp_bboxes=[fp_bbox], pads=pads)
+        cx, cy, angle = place_silkscreen(model)[0]
+        self.assertEqual((cx, angle), (15*MM, 0))
+        self.assertLess(cy + MM // 2, 10*MM)                 # above the part
+        from plugin.silkscreen import _overlaps, _expand_bbox
+        for pb in pads:
+            self.assertFalse(_overlaps(result_box(text, (cx, cy, angle)), _expand_bbox(pb, 200_000)))
+
+    def test_only_two_reading_directions(self):
+        boxes = [(10*MM, 10*MM, 14*MM, 30*MM), (30*MM, 10*MM, 50*MM, 14*MM),
+                 (60*MM, 60*MM, 61*MM, 61*MM)]
+        texts = [TextRect(fp_index=i, cx=0, cy=0, width=4*MM, height=1*MM, angle=90)
+                 for i in range(3)]
+        for res in place_silkscreen(make_silk_model(texts=texts, fp_bboxes=boxes)):
+            self.assertIn(res[2], (0, 90))
+
+    def test_fixed_references_are_obstacles(self):
+        fp_bbox = (40*MM, 40*MM, 50*MM, 50*MM)
+        fixed = [(43*MM, 44*MM, 47*MM, 46*MM)]          # a locked part's reference
+        text = TextRect(fp_index=0, cx=0, cy=0, width=4*MM, height=1*MM)
+        model = make_silk_model(texts=[text], fp_bboxes=[fp_bbox], fixed=fixed)
+        res = place_silkscreen(model)[0]
+        from plugin.silkscreen import _overlaps
+        self.assertFalse(_overlaps(result_box(text, res), fixed[0]))
 
     def test_collision_moves_to_candidate(self):
         """Text overlapping an obstacle gets moved to a free candidate."""
@@ -439,11 +473,9 @@ class TestSilkscreen(unittest.TestCase):
                         width=4*MM, height=1*MM)
         model = make_silk_model(texts=[text], fp_bboxes=[fp0_bbox, fp1_bbox])
         result = place_silkscreen(model)
-        cx, cy = result[0]
         # Should NOT overlap fp1 anymore
-        from plugin.silkscreen import _overlaps, _candidate_bbox
-        cbox = _candidate_bbox(cx, cy, text.width, text.height)
-        self.assertFalse(_overlaps(cbox, fp1_bbox))
+        from plugin.silkscreen import _overlaps
+        self.assertFalse(_overlaps(result_box(text, result[0]), fp1_bbox))
 
     def test_all_candidates_blocked_uses_fallback(self):
         """No free candidate — uses least-overlap fallback."""
@@ -476,11 +508,9 @@ class TestSilkscreen(unittest.TestCase):
             board_bbox=(0, 0, 100*MM, 100*MM),
         )
         result = place_silkscreen(model)
-        cx, cy = result[0]
         # Result must be inside board
-        from plugin.silkscreen import _inside, _candidate_bbox
-        cbox = _candidate_bbox(cx, cy, text.width, text.height)
-        self.assertTrue(_inside(cbox, model.board_bbox))
+        from plugin.silkscreen import _inside
+        self.assertTrue(_inside(result_box(text, result[0]), model.board_bbox))
 
     def test_respects_keepout(self):
         """Candidates overlapping keep-out zones are skipped."""
@@ -493,11 +523,9 @@ class TestSilkscreen(unittest.TestCase):
             texts=[text], fp_bboxes=[fp_bbox], keepouts=[keepout],
         )
         result = place_silkscreen(model)
-        cx, cy = result[0]
         # Result must not overlap the keepout
-        from plugin.silkscreen import _overlaps, _candidate_bbox
-        cbox = _candidate_bbox(cx, cy, text.width, text.height)
-        self.assertFalse(_overlaps(cbox, keepout))
+        from plugin.silkscreen import _overlaps
+        self.assertFalse(_overlaps(result_box(text, result[0]), keepout))
 
     def test_placed_texts_become_obstacles(self):
         """A text placed first blocks candidates for later texts."""
@@ -512,12 +540,8 @@ class TestSilkscreen(unittest.TestCase):
                                 fp_bboxes=[fp0_bbox, fp1_bbox])
         result = place_silkscreen(model)
         # Both texts should have been placed without overlapping each other
-        from plugin.silkscreen import _overlaps, _candidate_bbox
-        box0 = _candidate_bbox(result[0][0], result[0][1],
-                               text0.width, text0.height)
-        box1 = _candidate_bbox(result[1][0], result[1][1],
-                               text1.width, text1.height)
-        self.assertFalse(_overlaps(box0, box1))
+        from plugin.silkscreen import _overlaps
+        self.assertFalse(_overlaps(result_box(text0, result[0]), result_box(text1, result[1])))
 
     def test_density_ordering(self):
         """Most constrained refs are processed first (get priority)."""
@@ -555,15 +579,16 @@ class TestSilkscreen(unittest.TestCase):
         ]
         text = TextRect(fp_index=0, cx=52*MM, cy=52*MM,
                         width=3*MM, height=1*MM)
-        model = make_silk_model(texts=[text], fp_bboxes=obstacles)
+        # The part is all pad: its reference cannot sit in the middle.
+        model = make_silk_model(texts=[text], fp_bboxes=obstacles, pads=[center])
         result = place_silkscreen(model)
-        cx, cy = result[0]
+        cx, cy, _angle = result[0]
         # Should have found a diagonal position (not original position)
         self.assertNotEqual((cx, cy), (text.cx, text.cy),
                            "Should find a diagonal candidate")
         # Verify no collision with any obstacle
-        from plugin.silkscreen import _overlaps, _candidate_bbox
-        cbox = _candidate_bbox(cx, cy, text.width, text.height)
+        from plugin.silkscreen import _overlaps
+        cbox = result_box(text, result[0])
         for i, ob in enumerate(obstacles):
             if i == 0:
                 continue  # skip parent

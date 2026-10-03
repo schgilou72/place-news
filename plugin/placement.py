@@ -20,18 +20,23 @@ def footprints_by_uuid(board) -> Dict[str, object]:
     return {_uuid(fp): fp for fp in board.GetFootprints()}
 
 
-def save_original_positions(board) -> List[Tuple[str, str, int, int, float]]:
-    """Save original positions of all footprints for undo:
-    (uuid, reference, x, y, angle)."""
+def save_original_positions(board) -> List[tuple]:
+    """Save original positions of all footprints and of their references for
+    undo: (uuid, reference, x, y, angle, ref_x, ref_y, ref_angle)."""
     positions = []
     for fp in board.GetFootprints():
         pos = fp.GetPosition()
+        ref = fp.Reference()
+        rpos = ref.GetPosition()
         positions.append((
             _uuid(fp),
             fp.GetReference(),
             pos.x,
             pos.y,
             fp.GetOrientationDegrees(),
+            rpos.x,
+            rpos.y,
+            ref.GetTextAngleDegrees(),
         ))
     return positions
 
@@ -40,11 +45,16 @@ def restore_original_positions(board, positions: List[Tuple[str, str, int, int, 
     """Restore footprints to their original positions (undo)."""
     import pcbnew
     by_uuid = footprints_by_uuid(board)
-    for uid, ref, x, y, angle in positions:
+    for entry in positions:
+        uid, ref, x, y, angle = entry[:5]
         fp = by_uuid.get(uid) if uid else board.FindFootprintByReference(ref)
         if fp is not None:
             fp.SetPosition(pcbnew.VECTOR2I(x, y))
             fp.SetOrientation(pcbnew.EDA_ANGLE(angle, pcbnew.DEGREES_T))
+            if len(entry) >= 8:
+                text = fp.Reference()
+                text.SetTextAngleDegrees(entry[7])
+                text.SetPosition(pcbnew.VECTOR2I(entry[5], entry[6]))
     board.GetConnectivity().RecalculateRatsnest()
     pcbnew.Refresh()
 

@@ -322,7 +322,8 @@ class _ResultsDialog(wx.Dialog):
     def __init__(self, parent, *, hpwl_before_mm, hpwl_after_mm, hpwl_change_pct,
                  n_overlaps, n_keepout, n_silk_moved, elapsed, total_moves,
                  accepted_moves, iso_checked=False, iso_lines=(), n_iso_internal=0,
-                 internal_refs=(), n_iso_fixed=0, n_areas=0, n_area_violations=0):
+                 internal_refs=(), n_iso_fixed=0, n_areas=0, n_area_violations=0,
+                 alignment=None):
         super().__init__(parent, title="place-news \u2014 Results",
                          style=wx.DEFAULT_DIALOG_STYLE)
 
@@ -421,8 +422,19 @@ class _ResultsDialog(wx.Dialog):
         else:
             add_metric(self._CROSS, red, "Keep-out violations", f"{n_keepout}")
 
+        # Rows / columns tidy-up (informational)
+        if alignment is not None:
+            if alignment.parts_moved:
+                extra = (alignment.hpwl_after - alignment.hpwl_before) / 1e6
+                align_msg = (f"{alignment.parts_moved} parts on {alignment.lines} line(s)"
+                             f"  ({extra:+.1f} mm wire)")
+            else:
+                align_msg = "nothing to align"
+            add_metric(self._DASH, grey, "Rows / columns", align_msg)
+
         # Silkscreen (neutral — always informational)
-        silk_msg = f"{n_silk_moved} refs repositioned" if n_silk_moved > 0 else "no changes needed"
+        silk_msg = (f"{n_silk_moved} refs centred / repositioned" if n_silk_moved > 0
+                    else "no changes needed")
         add_metric(self._DASH, grey, "Silkscreen", silk_msg)
 
         sizer.Add(metrics_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 16)
@@ -892,6 +904,7 @@ class PlaceNewsAction(pcbnew.ActionPlugin):
             n_iso_fixed=len(iso_fixed),
             n_areas=len(verify_model.placement_areas),
             n_area_violations=len(area_violations),
+            alignment=getattr(result, 'alignment', None),
         )
         accepted = rdlg.ShowModal() == wx.ID_OK
         rdlg.Destroy()

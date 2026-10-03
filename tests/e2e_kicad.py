@@ -255,7 +255,7 @@ def place_board(workdir):
     random.seed(11)
     board, path = build_board(workdir)
     model = extract_board_model(board)
-    run_sa(model, SAConfig(max_iterations=120, reheat_count=2))
+    run_sa(model, SAConfig(max_iterations=120, reheat_count=2, align_rows=True))
     apply_model_to_board(board, model)
     verify = extract_board_model(board)
     silk = extract_silkscreen_model(board, verify)
