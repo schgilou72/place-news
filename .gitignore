@@ -25,3 +25,4 @@ tests/sample_boards/
 CLAUDE.md
 docs/
 plugin/route_settings.json
+dist/

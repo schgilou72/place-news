@@ -1,0 +1,8 @@
+(version 1)
+# Reinforced isolation between the primary side (HV, PRI) and the secondary side
+(rule "isolation creepage"
+  (constraint creepage (min 6mm))
+  (condition "(A.hasNetclass('HV') || A.hasNetclass('PRI')) && B.hasNetclass('SEC')"))
+(rule "isolation clearance"
+  (constraint clearance (min 4mm))
+  (condition "(A.hasNetclass('HV') || A.hasNetclass('PRI')) && B.hasNetclass('SEC')"))

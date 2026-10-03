@@ -1,93 +1,170 @@
-# CadMust-Neo
+# place-news
 
-A KiCad Action Plugin that optimizes PCB component placement using simulated annealing. It minimizes total wirelength while respecting board boundaries, courtyard overlaps, and keep-out zones.
+KiCad action plugins for boards where **isolation matters** (switch-mode power
+supplies, mains and high-voltage circuits):
 
-## Features
+- **place-news** — automatic component placement (simulated annealing) that
+  keeps parts as far apart as your clearance and creepage rules demand, and
+  honours KiCad rule areas (keep-outs, placement areas).
+- **place-news — Route (Freerouting)** — autorouting with
+  [Freerouting](https://github.com/freerouting/freerouting), with your net-class
+  clearances and custom `.kicad_dru` rules (clearance, creepage) passed to the
+  router.
 
-- **Simulated annealing** with auto-calibrated temperature, adaptive cooling, reheating, and greedy refinement
-- **Move operators**: translate, swap, rotate, and net-aware median moves
-- **Constraints**: board outline (rectangular and polygon), courtyard overlap avoidance, keep-out zones
-- **Component groups**: grouped components move as rigid bodies
-- **Power net detection**: automatically excludes power/ground nets from wirelength optimization
-- **Net exclusion control**: choose which nets to include in optimization
-- **Multi-start mode**: run multiple independent starts and keep the best result
-- **Tiered settings**: Basic (one-click presets), Normal (key parameters), Expert (full control)
-- **Progress display**: real-time temperature and wirelength bars with cancel support
-- **Silkscreen auto-placement**: post-optimization reference designator positioning
-- **Undo support**: Edit > Undo restores original placement; cancel aborts without changes
-- **Zero dependencies**: pure Python, no external packages required
+KiCad's own DRC stays the judge: both actions can finish with a DRC run, and the
+rules are always applied on the safe side (straight-line distance, never longer
+than KiCad's creepage path).
+
+place-news is derived from [CadMust-Neo](https://github.com/remiblokker/CadMust-Neo)
+by Remi Blokker (MIT licence).
 
 ## Requirements
 
-- KiCad 9.x (tested with 9.0.7)
-- No additional Python packages needed
+- KiCad 10.0 (tested with 10.0.6). Uses the SWIG Python API, which KiCad 10
+  still ships (it is planned to be removed in KiCad 11).
+- For routing: **Java 25 or later** and **Freerouting 2.4 or later**
+  (`freerouting-2.x.x-executable.jar`, from the
+  [Freerouting releases](https://github.com/freerouting/freerouting/releases)
+  or installed by KiCad's Freerouting plugin). Java: e.g.
+  [Eclipse Temurin](https://adoptium.net/temurin/releases/).
+- Nothing else: pure Python, no extra packages.
 
 ## Installation
 
-### Manual install
+**Plugin and Content Manager (recommended):** in KiCad, *Plugin and Content
+Manager → Install from File…* and choose `place-news-<version>-pcm.zip`.
 
-1. Download or clone this repository
-2. Copy (or symlink) the `plugin/` folder into your KiCad scripting plugins directory:
+**Manual:** in the PCB editor, *Tools → External Plugins → Open Plugin
+Directory*, copy the `plugin/` folder there as `place_news/`, then *Tools →
+External Plugins → Refresh Plugins*.
 
-| OS | Plugin directory |
-|----|-----------------|
-| macOS | `~/Library/Preferences/kicad/9.0/scripting/plugins/CadMustNeo/` |
-| Linux | `~/.local/share/kicad/9.0/scripting/plugins/CadMustNeo/` |
-| Windows | `%APPDATA%\kicad\9.0\scripting\plugins\CadMustNeo\` |
+Two toolbar buttons appear: placement (green grid) and routing (trace with a
+dashed isolation line).
 
-3. Restart KiCad. The CadMust-Neo icon appears in the PCB Editor toolbar.
+To try it: open `examples/flyback/flyback.kicad_pcb` (an isolated flyback
+with HV / PRI / SEC net classes and 6 mm creepage rules, parts still piled up)
+and run both actions.
 
-## Usage
+## Placement
 
-1. Open a PCB in KiCad's PCB Editor
-2. Optionally select specific components (lock any you don't want moved)
-3. Click the CadMust-Neo toolbar button
-4. Choose a quality preset (Fast / Balanced / Thorough) or switch to Expert mode for full control
-5. Click **Optimize**
-6. Review the results — accept to keep the new placement, or reject to revert
+1. Draw the board outline on Edge.Cuts; lock connectors, mounting holes and
+   anything mechanically fixed.
+2. Optional: rule areas with *Keep out footprints / pads* reserve space; rule
+   areas with *Placement* enabled (sheet, component class or group) keep their
+   parts inside — and, with *Exclusive placement areas*, other parts outside.
+3. Click **place-news**, choose a preset, **Optimize**.
+4. The result dialog lists wirelength, overlaps, isolation, placement areas and
+   keep-outs. *Edit → Undo* restores the previous placement.
 
-## Tips & workflow
+### Isolation during placement
 
-### Recommended workflow
+For every pair of pads on different nets, the required distance is the larger
+of:
 
-1. **Draw the board outline** on the Edge.Cuts layer. The optimizer needs this to keep components within bounds.
-2. **Lock mechanical constraints** — connectors, mounting holes, LEDs, switches. Right-click → Properties → check "Locked".
-3. **Place and lock critical ICs** (optional but recommended) — roughly position your key components (microcontrollers, FPGAs, memory ICs, etc.) and their immediate support circuitry where they need to be, then lock them. The optimizer will pull unlocked components toward these anchors via net connectivity. Alternatively, you can skip this step and let the optimizer do a first pass on everything — then lock what looks good and iterate.
-4. **Position and group decoupling caps** with their IC (select all, right-click → Grouping → Group) so they stay together as a rigid body during optimization.
-5. **Run the optimizer** on all remaining unlocked components to get a proper initial placement.
-6. **Iterate** — if an area doesn't look right, unlock it, adjust, and re-run.
+- the clearance KiCad applies: net-class clearance (the larger of the two), or
+  the last matching custom `clearance` rule, never below the board minimum;
+- `physical_clearance` rules;
+- `creepage` rules. KiCad evaluates creepage **between nets** (with a stand-in
+  track of each net on every copper layer), so creepage conditions can use net
+  names, net classes and layers, not footprint properties.
 
-### Additional tips
+Non-plated holes (mounting holes) count for creepage only. Pairs inside one
+footprint cannot be fixed by placement; they are reported separately ("inside
+footprints"), as are pairs between two locked parts.
 
-**Use "Move selected only" for targeted rework.** If your board is mostly done but a specific area needs rearranging, select just those components and enable "Move selected components only". This leaves the rest of the board untouched.
+### Supported rule conditions
 
-**Multi-start mode prevents regression.** With multiple starts (Expert mode), start 0 always preserves your current placement as a baseline. The optimizer can only improve on it — if no better placement is found, you get your original back.
+`A.`/`B.` with `NetClass`, `NetName`, `Type`, `Pad_Type`, `Layer`,
+`hasNetclass()`, `hasExactNetclass()`, `hasComponentClass()`,
+`memberOfSheet()`, `memberOfSheetOrChildren()`, `memberOfFootprint()`
+(reference, `lib:footprint` or `${Class:…}`), `memberOfGroup()`,
+`existsOnLayer()`, `isPlated()`, combined with `!`, `&&`, `||`, `==`, `!=` and
+parentheses. Semantics follow KiCad: last matching rule wins, a rule matches if
+its condition holds for (A, B) or (B, A), `&&` binds less tightly than `||`,
+string `==` is case-insensitive and accepts `*`/`?` in a right-hand literal.
+A rule using anything else is listed as ignored in the dialogs — never guessed.
 
-**Power and ground nets are auto-detected.** Nets like GND, VCC, VDD are automatically excluded from wirelength optimization since they'll be connected by power planes. You can override this in the net exclusion list (Normal/Expert mode).
+Example (`<project>.kicad_dru`):
 
-## How it works
-
-CadMust-Neo extracts component positions, pad locations, and net connectivity from KiCad into a pure Python model. The simulated annealing optimizer explores placement alternatives by:
-
-1. **Calibrating** the starting temperature to achieve ~95% initial acceptance
-2. **Annealing** with adaptive cooling rates based on acceptance ratio
-3. **Reheating** from the best solution found so far (3 rounds)
-4. **Refining** with greedy local search (translate + rotate)
-
-The cost function combines half-perimeter wirelength (HPWL) with penalty terms for courtyard overlaps, boundary violations, and keep-out zone intrusions.
-
-## Running tests
-
-```bash
-python3 -m unittest tests.test_optimizer -v
+```
+(version 1)
+(rule "isolation creepage"
+  (constraint creepage (min 6mm))
+  (condition "(A.hasNetclass('HV') || A.hasNetclass('PRI')) && B.hasNetclass('SEC')"))
+(rule "isolation clearance"
+  (constraint clearance (min 4mm))
+  (condition "(A.hasNetclass('HV') || A.hasNetclass('PRI')) && B.hasNetclass('SEC')"))
 ```
 
-Tests use synthetic board models and don't require KiCad.
+## Routing with Freerouting
 
-## Heritage
+1. Place the parts (with place-news or by hand) and save the board.
+2. Click **place-news — Route (Freerouting)**. The dialog finds the
+   Freerouting jar and Java (or lets you pick them) and shows the isolation
+   distances that will be given to the router.
+3. **Route**. Freerouting runs in the background (progress, *Cancel*), the
+   routes are imported, then KiCad's DRC runs on a copy of the board and the
+   summary shows unrouted connections and clearance / creepage results.
+4. *Edit → Undo* reverts the routing. Refill zones (*B*) afterwards.
 
-CadMust-Neo builds on CadMust, a RISC OS PCB CAD suite from the 1990s that included one of the earliest placement optimizers for desktop PCB design.
+What place-news changes in the Specctra file before routing:
 
-## License
+- **Rule areas**: KiCad exports every rule area as a full routing keep-out,
+  even areas that only keep out footprints or pads, and placement areas. Each
+  area now follows its own *Keep out tracks / vias* settings.
+- **Isolation rules**: Freerouting knows one clearance per pair of net
+  classes. Each class gets the clearance its own nets need between them, and a
+  `class_class` rule is written for every pair of classes that needs another
+  value (e.g. 6 mm between primary and secondary classes). Creepage becomes a
+  straight-line clearance.
+- KiCad's `smd_smd` pad-to-pad allowance is dropped when it would let the
+  default class bypass these rules; Freerouting may then report pad-to-pad
+  "violations" inside fine-pitch footprints (pads are fixed; KiCad's DRC is
+  what counts).
+- Freerouting ≥ 2.4 may fan out SMD pins with the default class's vias when a
+  class's own via does not fit; that is disabled, since those vias would carry
+  the default clearance.
+- Parts never move: the session's placement section is ignored on import.
 
-[MIT](LICENSE)
+Freerouting runs with `--usage_and_diagnostic_data.disable_analytics=true`.
+It still checks GitHub for a newer version when it starts.
+
+### Known KiCad behaviour
+
+KiCad's creepage check treats rule areas as items without a net: with a rule
+such as `A.hasNetclass('HV') && !B.hasNetclass('HV')`, it reports "creepage"
+between HV pads and nearby rule-area outlines. Writing the rule against an
+explicit class (`B.hasNetclass('SEC')`) avoids it. The route summary counts
+these separately.
+
+## Tips
+
+- Give the high-voltage and the isolated sides their own net classes (e.g. HV,
+  PRI, SEC) and write isolation rules between classes.
+- Parts that bridge the barrier (transformers, optocouplers, Y capacitors) must
+  have pin spacing at least the creepage distance; otherwise their pins are
+  reported "inside footprints" and the router cannot leave those pins legally.
+- "Move selected only" reworks one area without touching the rest.
+- Power nets (GND, VCC, …) are excluded from wirelength; adjust the list in
+  Normal / Expert mode.
+
+## Tests
+
+```bash
+python3 -m unittest tests.test_optimizer tests.test_rules_isolation tests.test_routing -v
+```
+
+These need no KiCad. With KiCad's Python (`pcbnew`, `kicad-cli`) the
+end-to-end tests build an isolated flyback board, place it, check it with
+KiCad's DRC, then route it through Freerouting and check again:
+
+```bash
+PLACE_NEWS_FREEROUTING_JAR=/path/to/freerouting-2.4.1-executable.jar \
+  python3 -m unittest tests.e2e_kicad -v
+xvfb-run -a python3 tests/gui_smoke.py          # placement action, dialogs included
+xvfb-run -a python3 tests/gui_route_smoke.py    # routing action, dialogs included
+```
+
+## Licence
+
+[MIT](LICENSE). Freerouting is a separate program (GPL-3.0), not included.

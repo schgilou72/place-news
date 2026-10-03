@@ -74,7 +74,7 @@ def save_settings(data: Dict[str, Any]) -> None:
 class SettingsDialog(wx.Dialog):
     """place-news settings dialog with Basic / Normal / Expert tiers.
 
-    board_info (optional) — dict produced by cadmust_neo_action._build_board_info():
+    board_info (optional) — dict produced by place_news_action._build_board_info():
         moveable:    int   — number of moveable components
         locked:      int   — number of locked components
         signal_nets: int   — number of signal nets (non-power, >= 2 pads)
