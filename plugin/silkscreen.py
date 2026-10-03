@@ -245,7 +245,8 @@ def extract_silkscreen_model(board, board_model: BoardModel) -> SilkscreenModel:
     texts = []
     fp_bboxes = [fp.bbox for fp in board_model.footprints]
 
-    # Build a map from reference string to footprint index
+    # Map footprints by UUID (references can repeat); fall back to reference.
+    uuid_to_idx = {fp.uuid: fp.index for fp in board_model.footprints if fp.uuid}
     ref_to_idx = {fp.reference: fp.index for fp in board_model.footprints}
 
     for fp in board.GetFootprints():
@@ -256,9 +257,15 @@ def extract_silkscreen_model(board, board_model: BoardModel) -> SilkscreenModel:
         if layer not in (pcbnew.F_SilkS, pcbnew.B_SilkS):
             continue
 
-        ref_str = fp.GetReference()
-        fp_idx = ref_to_idx.get(ref_str)
+        try:
+            uid = str(fp.m_Uuid.AsString())
+        except Exception:
+            uid = ''
+        fp_idx = uuid_to_idx.get(uid) if uid else ref_to_idx.get(fp.GetReference())
         if fp_idx is None:
+            continue
+        # Hand-placed (locked) parts keep their silkscreen as the designer left it.
+        if board_model.footprints[fp_idx].locked:
             continue
 
         bbox = ref_text.GetBoundingBox()
@@ -292,31 +299,29 @@ def apply_silkscreen(board, silk_model: SilkscreenModel,
     """Write new reference positions back to pcbnew. Returns count moved."""
     import pcbnew
 
-    # Build map from reference string to board footprint
-    ref_to_kfp = {}
-    for fp in board.GetFootprints():
-        ref_to_kfp[fp.GetReference()] = fp
-
-    # Build map from fp_index to reference string
-    idx_to_ref: dict = {}
-    if board_model is not None:
-        for fp in board_model.footprints:
-            idx_to_ref[fp.index] = fp.reference
-    else:
-        # Fallback: use silk_model texts to find references
-        for fp in board.GetFootprints():
-            ref_to_kfp[fp.GetReference()] = fp
+    # Board footprints in model order (GetFootprints() order is the model's
+    # fp_index order); fall back to UUID / reference lookups if sizes differ.
+    kfps = list(board.GetFootprints())
+    by_uuid = {}
+    by_ref = {}
+    for fp in kfps:
+        try:
+            by_uuid[str(fp.m_Uuid.AsString())] = fp
+        except Exception:
+            pass
+        by_ref.setdefault(fp.GetReference(), fp)
 
     moved = 0
     for text, (new_cx, new_cy) in zip(silk_model.texts, new_positions):
         if new_cx == text.cx and new_cy == text.cy:
             continue
 
-        # Look up the pcbnew footprint by reference string
-        ref_str = idx_to_ref.get(text.fp_index)
-        if ref_str is None:
-            continue
-        kfp = ref_to_kfp.get(ref_str)
+        kfp = None
+        if board_model is not None and text.fp_index < len(board_model.footprints):
+            mfp = board_model.footprints[text.fp_index]
+            kfp = by_uuid.get(mfp.uuid) if mfp.uuid else by_ref.get(mfp.reference)
+        elif text.fp_index < len(kfps):
+            kfp = kfps[text.fp_index]
         if kfp is None:
             continue
 

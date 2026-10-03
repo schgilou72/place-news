@@ -683,7 +683,7 @@ def run_sa(
     total_time = time.perf_counter() - run_t0
     sa_time = total_time - greedy_time
     lines = [
-        f"\n=== CadMust-Neo Profile ({n_moveable} moveable components"
+        f"\n=== place-news profile ({n_moveable} moveable components"
         + (f", {num_starts} starts" if num_starts > 1 else "") + f") ===",
         f"  Total time:       {total_time:7.1f}s",
         f"  SA phases:        {sa_time:7.1f}s  ({sa_time/total_time*100:.0f}%)",

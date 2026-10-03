@@ -1,4 +1,7 @@
-"""CadMust-Neo KiCad Action Plugin — entry point."""
+"""place-news KiCad Action Plugin — entry point.
+
+place-news is derived from CadMust-Neo by Remi Blokker (MIT licence).
+"""
 import os
 import pcbnew
 import wx
@@ -318,8 +321,9 @@ class _ResultsDialog(wx.Dialog):
 
     def __init__(self, parent, *, hpwl_before_mm, hpwl_after_mm, hpwl_change_pct,
                  n_overlaps, n_keepout, n_silk_moved, elapsed, total_moves,
-                 accepted_moves):
-        super().__init__(parent, title="CadMust-Neo \u2014 Results",
+                 accepted_moves, iso_checked=False, iso_lines=(), n_iso_internal=0,
+                 internal_refs=(), n_iso_fixed=0, n_areas=0, n_area_violations=0):
+        super().__init__(parent, title="place-news \u2014 Results",
                          style=wx.DEFAULT_DIALOG_STYLE)
 
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -327,7 +331,7 @@ class _ResultsDialog(wx.Dialog):
         # --- Verdict ---
         hpwl_good = hpwl_change_pct >= 0
         overlaps_good = n_overlaps == 0
-        keepout_good = n_keepout == 0
+        keepout_good = n_keepout == 0 and len(iso_lines) == 0 and n_area_violations == 0
 
         if hpwl_good and overlaps_good and keepout_good:
             verdict_text = "Placement improved"
@@ -385,6 +389,32 @@ class _ResultsDialog(wx.Dialog):
         else:
             add_metric(self._CROSS, red, "Overlaps", f"{n_overlaps} pairs")
 
+        amber = wx.Colour(200, 140, 0)
+
+        # Isolation (clearance / creepage) between parts
+        if iso_checked:
+            if not iso_lines:
+                add_metric(self._CHECK, green, "Isolation", "all pad pairs meet the rules")
+            else:
+                worst = iso_lines[0]
+                more = f"  (+{len(iso_lines) - 1} more)" if len(iso_lines) > 1 else ""
+                add_metric(self._CROSS, red, "Isolation", f"{worst}{more}")
+            if n_iso_internal:
+                refs = ", ".join(list(internal_refs)[:6]) + ("…" if len(internal_refs) > 6 else "")
+                add_metric(self._DASH, amber, "Inside footprints",
+                           f"{n_iso_internal} pad pairs too close ({refs}) — footprint choice")
+            if n_iso_fixed:
+                add_metric(self._DASH, amber, "Locked parts",
+                           f"{n_iso_fixed} pad pairs too close between locked parts")
+
+        # Placement areas
+        if n_areas:
+            if n_area_violations == 0:
+                add_metric(self._CHECK, green, "Placement areas", "respected")
+            else:
+                add_metric(self._CROSS, red, "Placement areas",
+                           f"{n_area_violations} part(s) outside or intruding")
+
         # Keep-out violations
         if n_keepout == 0:
             add_metric(self._CHECK, green, "Keep-out violations", "none")
@@ -435,7 +465,7 @@ class _ProgressDialog(wx.Dialog):
     """Custom progress dialog with temperature gradient bar and wirelength bar."""
 
     def __init__(self, parent, initial_hpwl):
-        super().__init__(parent, title="CadMust-Neo Optimizer",
+        super().__init__(parent, title="place-news \u2014 Optimizer",
                          style=wx.DEFAULT_DIALOG_STYLE)
         self.cancelled = False
         self._initial_hpwl = initial_hpwl
@@ -582,18 +612,62 @@ def _build_board_info(model, cs):
     n_moveable = len(model.moveable_indices)
     n_locked = sum(1 for fp in model.footprints if fp.locked)
 
+    iso = model.isolation
+    if iso is None:
+        iso_summary = "Isolation rules not read."
+    else:
+        counts = iso.rules.summary() if iso.rules else {}
+        n_rules = len(iso.rules.rules) if iso.rules else 0
+        rules_txt = (f"{n_rules} custom rule(s): " + ", ".join(
+            f"{v} {k}" for k, v in counts.items() if v)) if n_rules else "no custom rule"
+        if iso.active:
+            iso_summary = (f"Up to {iso.max_req / 1e6:.2f} mm between pads of different nets "
+                           f"· {rules_txt}")
+        else:
+            iso_summary = f"Nothing above {iso.threshold / 1e6:.2f} mm · {rules_txt}"
+
     return {
         'moveable': n_moveable,
         'locked': n_locked,
         'signal_nets': signal_nets,
         'hpwl_mm': cs.hpwl / 1e6,
         'net_list': net_list,
+        'iso_summary': iso_summary,
+        'n_areas': len(model.placement_areas),
+        'n_keepouts': len(model.keepouts),
+        'warnings': list(model.warnings),
     }
 
 
-class CadMustNeoAction(pcbnew.ActionPlugin):
+def _pad_label(model, fi, pi):
+    fp = model.footprints[fi]
+    num = fp.pads[pi].number if pi < len(fp.pads) else ''
+    return f"{fp.reference}.{num}" if num else fp.reference
+
+
+def _isolation_report(model):
+    """Split isolation violations into placement ones (between footprints,
+    at least one moveable), footprint-internal ones and locked-locked ones."""
+    from .isolation import list_violations
+    iso = model.isolation
+    if iso is None or not iso.active:
+        return [], [], []
+    placement, internal, fixed = [], [], []
+    for v in list_violations(iso, model.footprints):
+        ga = model.fp_to_group.get(v.fp_a)
+        if v.fp_a == v.fp_b:
+            internal.append(v)
+        elif (model.footprints[v.fp_a].locked and model.footprints[v.fp_b].locked) or \
+                (ga is not None and ga == model.fp_to_group.get(v.fp_b)):
+            fixed.append(v)
+        else:
+            placement.append(v)
+    return placement, internal, fixed
+
+
+class PlaceNewsAction(pcbnew.ActionPlugin):
     def defaults(self):
-        self.name = "CadMust-Neo"
+        self.name = "place-news"
         self.category = "Layout"
         self.description = "Optimize component placement using simulated annealing"
         self.show_toolbar_button = True
@@ -607,7 +681,7 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         if moveable_count < 2:
             wx.MessageBox(
                 "Need at least 2 unlocked footprints to optimize.",
-                "CadMust-Neo", wx.OK | wx.ICON_WARNING,
+                "place-news", wx.OK | wx.ICON_WARNING,
             )
             return
 
@@ -625,6 +699,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         config = dlg.build_config()
         selected_only = dlg.move_selected_only
         excluded_net_names = dlg.excluded_net_names
+        use_isolation = dlg.use_isolation
+        exclusive_areas = dlg.exclusive_areas
         dlg.Destroy()
 
         # If "move selected only" is on, verify something is selected
@@ -638,7 +714,7 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
                     "No unlocked components are selected.\n\n"
                     "Select the components you want to optimize in the PCB editor first,\n"
                     "or uncheck 'Move selected components only'.",
-                    "CadMust-Neo", wx.OK | wx.ICON_WARNING,
+                    "place-news", wx.OK | wx.ICON_WARNING,
                 )
                 return
 
@@ -646,7 +722,9 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         original_positions = save_original_positions(board)
 
         # Extract board model into pure Python structures
-        model = extract_board_model(board, selected_only=selected_only)
+        model = extract_board_model(board, selected_only=selected_only,
+                                    use_isolation=use_isolation,
+                                    exclusive_areas=exclusive_areas)
 
         # Apply user's net exclusion choices (overrides auto-detection)
         for nc, net in model.nets.items():
@@ -715,7 +793,7 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
                 f"Optimization cancelled.\n\n"
                 f"Best HPWL improvement so far: {cancel_hpwl_pct:.1f}%\n"
                 f"Apply partial result?",
-                "CadMust-Neo",
+                "place-news",
                 wx.YES_NO | wx.ICON_QUESTION,
             )
             if answer != wx.YES:
@@ -727,8 +805,12 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
 
         # Verify: re-extract model from KiCad and compare HPWL
         # This catches any position application issues
-        verify_model = extract_board_model(board, selected_only=selected_only)
+        verify_model = extract_board_model(board, selected_only=selected_only,
+                                           use_isolation=use_isolation,
+                                           exclusive_areas=exclusive_areas)
         verify_cs = CostState(verify_model)
+        iso_placement, iso_internal, iso_fixed = _isolation_report(verify_model)
+        area_violations = verify_cs.area_violations()
 
         # Auto-place silkscreen reference designators
         from .silkscreen import extract_silkscreen_model, place_silkscreen, apply_silkscreen
@@ -760,10 +842,23 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             hpwl_msg = f"HPWL: {hpwl_before_mm:.1f} mm \u2192 {hpwl_after_mm:.1f} mm ({hpwl_change_pct:.1f}% shorter)"
         else:
             hpwl_msg = f"HPWL: {hpwl_before_mm:.1f} mm \u2192 {hpwl_after_mm:.1f} mm ({-hpwl_change_pct:.1f}% longer)"
+        def _viol_text(v):
+            return (f"{_pad_label(verify_model, v.fp_a, v.pad_a)} ↔ "
+                    f"{_pad_label(verify_model, v.fp_b, v.pad_b)}: "
+                    f"{v.gap / 1e6:.2f} / {v.required / 1e6:.2f} mm")
+
+        iso_lines = [_viol_text(v) for v in iso_placement]
+        internal_refs = sorted({verify_model.footprints[v.fp_a].reference for v in iso_internal})
         result_summary = (
             f"Optimization complete!\n\n"
             f"{hpwl_msg}\n"
             f"Overlaps: {n_overlaps} pairs\n"
+            f"Isolation (between parts): {len(iso_placement)} pad pairs\n"
+            + "".join(f"  - {line}\n" for line in iso_lines[:20])
+            + f"Isolation inside footprints: {len(iso_internal)} pad pairs "
+              f"({', '.join(internal_refs)})\n"
+            f"Isolation between locked parts: {len(iso_fixed)} pad pairs\n"
+            f"Placement areas: {len(area_violations)} part(s) outside / intruding\n"
             f"Keep-out violations: {n_keepout}\n"
             f"Silkscreen: {n_silk_moved} refs repositioned\n"
             f"Moves: {result.total_moves} total, {result.accepted_moves} accepted\n"
@@ -790,6 +885,13 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             elapsed=elapsed,
             total_moves=result.total_moves,
             accepted_moves=result.accepted_moves,
+            iso_checked=bool(verify_model.isolation and verify_model.isolation.active),
+            iso_lines=iso_lines,
+            n_iso_internal=len(iso_internal),
+            internal_refs=internal_refs,
+            n_iso_fixed=len(iso_fixed),
+            n_areas=len(verify_model.placement_areas),
+            n_area_violations=len(area_violations),
         )
         accepted = rdlg.ShowModal() == wx.ID_OK
         rdlg.Destroy()

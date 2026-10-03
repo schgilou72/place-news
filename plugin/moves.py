@@ -6,7 +6,7 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 from .board_model import BoardModel
-from .cost_function import point_in_polygon
+from .cost_function import point_in_polygon, keepout_overlap
 
 
 @dataclass
@@ -114,15 +114,15 @@ def _hits_new_keepout(model: BoardModel, members: List[int],
         old_ymax = old_cy + ohh
 
         for ko in model.keepouts:
-            # AABB overlap check — new position
-            new_hit = (new_xmin < ko.xmax and new_xmax > ko.xmin and
-                       new_ymin < ko.ymax and new_ymax > ko.ymin)
-            if not new_hit:
+            # Overlap check at the new position (side- and polygon-aware)
+            nx, ny = keepout_overlap(ko, fp.side, new_xmin, new_ymin, new_xmax, new_ymax,
+                                     fp.copper_sides)
+            if nx <= 0 or ny <= 0:
                 continue
             # Was it already overlapping this keepout?
-            old_hit = (old_xmin < ko.xmax and old_xmax > ko.xmin and
-                       old_ymin < ko.ymax and old_ymax > ko.ymin)
-            if not old_hit:
+            ox_, oy_ = keepout_overlap(ko, fp.side, old_xmin, old_ymin, old_xmax, old_ymax,
+                                       fp.copper_sides)
+            if ox_ <= 0 or oy_ <= 0:
                 return True  # new violation
     return False
 

@@ -44,6 +44,8 @@ _DEFAULTS: Dict[str, Any] = {
     "penalty_scale_min": 0.10,
     "num_starts": 1,
     "move_selected_only": False,
+    "use_isolation": True,
+    "exclusive_areas": True,
 }
 
 
@@ -70,7 +72,7 @@ def save_settings(data: Dict[str, Any]) -> None:
 
 
 class SettingsDialog(wx.Dialog):
-    """CadMust-Neo settings dialog with Basic / Normal / Expert tiers.
+    """place-news settings dialog with Basic / Normal / Expert tiers.
 
     board_info (optional) — dict produced by cadmust_neo_action._build_board_info():
         moveable:    int   — number of moveable components
@@ -88,7 +90,7 @@ class SettingsDialog(wx.Dialog):
 
     def __init__(self, parent,
                  board_info: Optional[Dict[str, Any]] = None):
-        super().__init__(parent, title="CadMust-Neo Settings",
+        super().__init__(parent, title="place-news \u2014 Settings",
                          style=wx.DEFAULT_DIALOG_STYLE)
 
         self._settings = load_settings()
@@ -173,6 +175,48 @@ class SettingsDialog(wx.Dialog):
         )
         main_sizer.Add(self._chk_selected_only, 0,
                        wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        # --- Design rules: isolation, placement areas ---
+        bi = self._board_info or {}
+        rules_box = wx.StaticBox(self, label="Design rules")
+        rules_sizer = wx.StaticBoxSizer(rules_box, wx.VERTICAL)
+        self._chk_isolation = wx.CheckBox(
+            self, label="Respect isolation rules (net classes + custom rules)")
+        self._chk_isolation.SetToolTip(
+            "Keeps pads of different nets at least as far apart as KiCad's DRC\n"
+            "will demand: net-class clearance and the clearance / creepage /\n"
+            "physical_clearance rules of the project's .kicad_dru file.\n"
+            "Distances are measured in a straight line, which is never longer\n"
+            "than KiCad's creepage path, so the result is on the safe side.")
+        rules_sizer.Add(self._chk_isolation, 0, wx.ALL, 5)
+        lbl_iso = wx.StaticText(self, label=bi.get('iso_summary', ''))
+        lbl_iso.SetForegroundColour(wx.Colour(80, 80, 80))
+        rules_sizer.Add(lbl_iso, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        self._chk_exclusive = wx.CheckBox(
+            self, label="Exclusive placement areas (other parts stay out)")
+        self._chk_exclusive.SetToolTip(
+            "Placement rule areas (one per hierarchical sheet, component class\n"
+            "or group) always keep their members inside. When this is checked,\n"
+            "parts that do not belong to an area are also kept out of it.")
+        n_areas = int(bi.get('n_areas', 0))
+        self._chk_exclusive.Show(n_areas > 0)
+        rules_sizer.Add(self._chk_exclusive, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        if n_areas or bi.get('n_keepouts'):
+            lbl_areas = wx.StaticText(
+                self, label=f"{n_areas} placement area(s), "
+                            f"{int(bi.get('n_keepouts', 0))} footprint keep-out(s)")
+            lbl_areas.SetForegroundColour(wx.Colour(80, 80, 80))
+            rules_sizer.Add(lbl_areas, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        warnings = list(bi.get('warnings', []))
+        if warnings:
+            shown = warnings[:4] + ([f"... and {len(warnings) - 4} more"] if len(warnings) > 4 else [])
+            lbl_warn = wx.StaticText(self, label="\n".join(shown))
+            lbl_warn.SetForegroundColour(wx.Colour(190, 110, 0))
+            lbl_warn.Wrap(420)
+            rules_sizer.Add(lbl_warn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        main_sizer.Add(rules_sizer, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
 
         # --- Parameters box (Normal + Expert) ---
         self._params_box = wx.StaticBox(self, label="Parameters")
@@ -414,6 +458,8 @@ class SettingsDialog(wx.Dialog):
         self._spin_penalty_scale.SetValue(float(s.get("penalty_scale_min", 0.10)))
         self._spin_num_starts.SetValue(int(s.get("num_starts", 1)))
         self._chk_selected_only.SetValue(bool(s.get("move_selected_only", False)))
+        self._chk_isolation.SetValue(bool(s.get("use_isolation", True)))
+        self._chk_exclusive.SetValue(bool(s.get("exclusive_areas", True)))
 
     def _on_preset_change(self, evt):
         """When preset changes in Expert mode, update the parameter controls."""
@@ -466,6 +512,16 @@ class SettingsDialog(wx.Dialog):
     def move_selected_only(self) -> bool:
         """True if only selected components should be moved."""
         return self._chk_selected_only.GetValue()
+
+    @property
+    def use_isolation(self) -> bool:
+        """True if clearance / creepage rules take part in the cost."""
+        return self._chk_isolation.GetValue()
+
+    @property
+    def exclusive_areas(self) -> bool:
+        """True if non-members are kept out of placement areas."""
+        return self._chk_exclusive.GetValue()
 
     @property
     def excluded_net_names(self):
@@ -527,6 +583,8 @@ class SettingsDialog(wx.Dialog):
             "penalty_scale_min": self._spin_penalty_scale.GetValue(),
             "num_starts": self._spin_num_starts.GetValue(),
             "move_selected_only": self._chk_selected_only.GetValue(),
+            "use_isolation": self._chk_isolation.GetValue(),
+            "exclusive_areas": self._chk_exclusive.GetValue(),
         }
         save_settings(data)
         self.EndModal(wx.ID_OK)

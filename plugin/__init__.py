@@ -1,8 +1,12 @@
-__version__ = "0.1.0"
+"""place-news — placement optimizer for KiCad, aware of isolation rules.
+
+Derived from CadMust-Neo by Remi Blokker (MIT licence).
+"""
+__version__ = "0.2.0"
 
 try:
-    from .cadmust_neo_action import CadMustNeoAction
-    CadMustNeoAction().register()
+    from .place_news_action import PlaceNewsAction
+    PlaceNewsAction().register()
 except ImportError:
     # Running outside KiCad (e.g., unit tests) — pcbnew not available
     pass
