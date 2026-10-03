@@ -77,13 +77,15 @@ def _profile_key(info: PadInfo, attrs: FrozenSet[str]) -> PadInfo:
         blank['net_name'] = ''
     if 'fp_ref' not in attrs:
         blank['fp_ref'] = ''
+    if 'fp_lib_id' not in attrs:
+        blank['fp_lib_id'] = ''
     if 'component_classes' not in attrs:
         blank['component_classes'] = ()
     if 'sheet' not in attrs:
         blank['sheet'] = ''
     if 'groups' not in attrs:
         blank['groups'] = ()
-    if 'pad_type' not in attrs:
+    if 'pad_type' not in attrs and info.pad_type != 'npth':
         blank['pad_type'] = 'smd'
     if 'layers' not in attrs:
         blank['layers'] = ('F.Cu',)

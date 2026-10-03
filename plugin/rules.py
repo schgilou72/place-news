@@ -17,16 +17,21 @@ guessed. Semantics follow KiCad's DRC engine:
 
 * the last matching rule in the file wins for a given constraint;
 * a rule matches a pair if its condition holds for (A, B) or for (B, A);
-* string ``==`` is case-insensitive and treats ``*``/``?`` as wildcards;
+* string ``==`` is case-insensitive; a literal on the right-hand side may
+  use ``*``/``?`` wildcards; a property the item does not have (e.g.
+  ``Pad_Type`` of a track) makes both ``==`` and ``!=`` false;
 * ``A.NetClass == 'X'`` is true when X is one of the item's net classes;
 * when no custom clearance rule matches, the clearance is the larger of the
-  two net-class clearances (and never below the board minimum).
+  two net-class clearances (and never below the board minimum);
+* creepage is a property of two *nets*: KiCad evaluates creepage rules with
+  a stand-in track of each net on every copper layer, so ``A.Type`` is
+  'Track' and footprint functions (``memberOfFootprint()``, sheets, component
+  classes) are false there. Clearance rules see the real items.
 
 All distances are in nanometres (KiCad internal units).
 """
 from __future__ import annotations
 
-import fnmatch
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
@@ -133,7 +138,8 @@ def parse_sexpr(text: str) -> List[Any]:
 
 @dataclass(frozen=True)
 class PadInfo:
-    """What the rule evaluator knows about a pad (one side of a pair)."""
+    """What the rule evaluator knows about one copper item: a pad, or a
+    track / via of a net (``kind``)."""
     net_name: str = ''
     netclasses: Tuple[str, ...] = ('Default',)   # constituents, e.g. ('HV', 'Default')
     nc_clearance: int = 0                        # effective net-class clearance (nm)
@@ -141,13 +147,40 @@ class PadInfo:
     component_classes: Tuple[str, ...] = ()
     sheet: str = ''
     groups: Tuple[str, ...] = ()
-    pad_type: str = 'smd'                         # smd | tht | npth | conn
-    layers: Tuple[str, ...] = ('F.Cu',)           # copper layers; THT -> ('*.Cu',)
+    pad_type: str = 'smd'                         # smd | tht | npth | conn (pads only)
+    layers: Tuple[str, ...] = ('F.Cu',)           # copper layers; THT / vias -> ('*.Cu',)
+    kind: str = 'pad'                             # pad | track | via
+    fp_lib_id: str = ''                           # e.g. 'Package_TO_SOT_THT:TO-220-3_Vertical'
+
+    @property
+    def in_footprint(self) -> bool:
+        return self.kind == 'pad'
 
     def on_layer(self, layer: str) -> bool:
         if '*.Cu' in self.layers:
             return layer.endswith('.Cu') or layer in ('*.Cu', '*')
         return any(_wild_eq(layer, l) for l in self.layers)
+
+
+ItemInfo = PadInfo
+
+
+def track_item(net_name: str, netclasses: Tuple[str, ...], nc_clearance: int,
+               layer: str = 'F.Cu') -> PadInfo:
+    """A track of a net on one copper layer."""
+    return PadInfo(net_name=net_name, netclasses=netclasses, nc_clearance=nc_clearance,
+                   pad_type='', layers=(layer,), kind='track')
+
+
+def via_item(net_name: str, netclasses: Tuple[str, ...], nc_clearance: int) -> PadInfo:
+    """A through via of a net."""
+    return PadInfo(net_name=net_name, netclasses=netclasses, nc_clearance=nc_clearance,
+                   pad_type='', layers=('*.Cu',), kind='via')
+
+
+def net_view(item: PadInfo, layer: str) -> PadInfo:
+    """How KiCad's creepage test sees an item: a track of its net on `layer`."""
+    return track_item(item.net_name, item.netclasses, item.nc_clearance, layer)
 
 
 _PAD_TYPE_LABEL = {
@@ -158,10 +191,29 @@ _PAD_TYPE_LABEL = {
 }
 
 
+_WILD_CACHE: Dict[Tuple[str, bool], Any] = {}
+
+
+def _wx_match(text: str, pattern: str, case_sensitive: bool = True) -> bool:
+    """wxString::Matches / WildCompareString: whole-string match where only
+    '*' and '?' are special."""
+    key = (pattern, case_sensitive)
+    rx = _WILD_CACHE.get(key)
+    if rx is None:
+        body = ''.join('.*' if ch == '*' else '.' if ch == '?' else re.escape(ch) for ch in pattern)
+        rx = re.compile(body + r'\Z', re.DOTALL | (0 if case_sensitive else re.IGNORECASE))
+        _WILD_CACHE[key] = rx
+    return rx.match(text) is not None
+
+
+def _has_wild(s: str) -> bool:
+    return '*' in s or '?' in s
+
+
 def _wild_eq(value: str, pattern: str) -> bool:
-    """KiCad string equality: case-insensitive, wildcards in the pattern."""
-    if '*' in pattern or '?' in pattern:
-        return fnmatch.fnmatchcase(value.lower(), pattern.lower())
+    """Case-insensitive equality, wildcards in the pattern."""
+    if _has_wild(pattern):
+        return _wx_match(value, pattern, case_sensitive=False)
     return value.lower() == pattern.lower()
 
 
@@ -206,18 +258,44 @@ def _tokenize_expr(src: str) -> List[Tuple[str, str]]:
     return out
 
 
+class _Lit(str):
+    """A string literal written in the condition."""
+
+
+class _Undefined:
+    """Value of a property the item does not have (e.g. Pad_Type of a track)."""
+
+    def __repr__(self) -> str:
+        return 'undefined'
+
+
+_UNDEF = _Undefined()
+
+
+def _str_eq(x: str, y: str) -> bool:
+    """KiCad VALUE::EqualTo for strings: case-insensitive; wildcards only in
+    a literal on the right-hand side."""
+    if isinstance(y, _Lit) and _has_wild(y):
+        return _wx_match(x, y, case_sensitive=False)
+    return x.lower() == y.lower()
+
+
 class _NetClassValue:
-    """Value of A.NetClass: compares equal to any of its constituent names."""
+    """Value of A.NetClass: compares equal to any of its constituent names
+    (and to the full composite name, e.g. 'HV,Default')."""
 
     def __init__(self, names: Tuple[str, ...]):
         self.names = names
+
+    @property
+    def full(self) -> str:
+        return ','.join(self.names)
 
     def equals(self, other: Any) -> bool:
         if isinstance(other, _NetClassValue):
             return set(self.names) == set(other.names)
         if isinstance(other, str):
-            full = ','.join(self.names)
-            return _wild_eq(full, other) or any(_wild_eq(n, other) for n in self.names)
+            return any(_str_eq(n, other) for n in self.names) or _str_eq(self.full, other)
         return False
 
 
@@ -230,18 +308,22 @@ _FUNCS_1ARG = {
 }
 _FUNCS_0ARG = {'isPlated'}
 
-# Attribute of PadInfo each property/function depends on (for profiling).
+# Attributes of PadInfo each property/function depends on (for profiling).
+# 'kind' and the net-class data are always kept.
 _ATTR_OF = {
-    'NetClass': 'netclasses', 'hasNetclass': 'netclasses', 'hasExactNetclass': 'netclasses',
-    'NetName': 'net_name',
-    'Type': None,
-    'Pad_Type': 'pad_type', 'isPlated': 'pad_type',
-    'Layer': 'layers', 'existsOnLayer': 'layers',
-    'hasComponentClass': 'component_classes',
-    'memberOfSheet': 'sheet', 'memberOfSheetOrChildren': 'sheet',
-    'memberOfFootprint': 'fp_ref',
-    'memberOfGroup': 'groups',
+    'NetClass': ('netclasses',), 'hasNetclass': ('netclasses',),
+    'hasExactNetclass': ('netclasses',),
+    'NetName': ('net_name',),
+    'Type': (),
+    'Pad_Type': ('pad_type',), 'isPlated': ('pad_type',),
+    'Layer': ('layers',), 'existsOnLayer': ('layers',),
+    'hasComponentClass': ('component_classes',),
+    'memberOfSheet': ('sheet',), 'memberOfSheetOrChildren': ('sheet',),
+    'memberOfFootprint': ('fp_ref', 'fp_lib_id', 'component_classes'),
+    'memberOfGroup': ('groups',),
 }
+
+_TYPE_LABEL = {'pad': 'Pad', 'track': 'Track', 'via': 'Via'}
 
 
 class _Parser:
@@ -301,8 +383,8 @@ class _Parser:
             if op not in ('==', '!='):
                 raise UnsupportedRule(f"numeric comparison '{op}' is not supported")
             if op == '==':
-                return lambda a, b: _equals(left(a, b), right(a, b))
-            return lambda a, b: not _equals(left(a, b), right(a, b))
+                return lambda a, b: _equals(left(a, b), right(a, b)) is True
+            return lambda a, b: _equals(left(a, b), right(a, b)) is False
         return left
 
     def parse_unary(self) -> Evaluator:
@@ -323,7 +405,7 @@ class _Parser:
             return ev
         if kind == 'str':
             self.i += 1
-            s = val.replace("\\'", "'")
+            s = _Lit(val.replace("\\'", "'"))
             return lambda a, b: s
         if kind == 'num':
             raise UnsupportedRule("numeric values in conditions are not supported")
@@ -350,9 +432,7 @@ class _Parser:
         raise UnsupportedRule(f"unexpected token {tok!r} in condition")
 
     def _note(self, name: str) -> None:
-        attr = _ATTR_OF.get(name)
-        if attr:
-            self.attrs.add(attr)
+        self.attrs.update(_ATTR_OF.get(name, ()))
 
     def _prop(self, which: str, name: str) -> Evaluator:
         if name not in _SIMPLE_PROPS:
@@ -364,9 +444,10 @@ class _Parser:
         if name == 'NetName':
             return lambda a, b: pick(a, b).net_name
         if name == 'Type':
-            return lambda a, b: 'Pad'
+            return lambda a, b: _TYPE_LABEL.get(pick(a, b).kind, 'Pad')
         if name == 'Pad_Type':
-            return lambda a, b: _PAD_TYPE_LABEL.get(pick(a, b).pad_type, 'SMD')
+            return lambda a, b: (_PAD_TYPE_LABEL.get(pick(a, b).pad_type, 'SMD')
+                                 if pick(a, b).kind == 'pad' else _UNDEF)
         if name == 'Layer':
             return lambda a, b: _LayerValue(pick(a, b))
         raise UnsupportedRule(name)
@@ -383,33 +464,29 @@ class _Parser:
         self._note(name)
         pick = (lambda a, b: a) if which == 'A' else (lambda a, b: b)
         arg = args[0] if args else ''
+        # Footprint-related functions are false for tracks and vias (no
+        # parent footprint), as in KiCad's pcbexpr_functions.cpp.
         if name == 'hasNetclass':
-            return lambda a, b: any(_wild_eq(n, arg) for n in pick(a, b).netclasses)
+            return lambda a, b: arg in pick(a, b).netclasses
         if name == 'hasExactNetclass':
-            return lambda a, b: ','.join(pick(a, b).netclasses) == arg or (
-                len(pick(a, b).netclasses) == 1 and pick(a, b).netclasses[0] == arg)
+            return lambda a, b: ','.join(pick(a, b).netclasses) == arg
         if name == 'hasComponentClass':
-            return lambda a, b: any(_wild_eq(c, arg) for c in pick(a, b).component_classes)
+            return lambda a, b: (pick(a, b).in_footprint
+                                 and arg in pick(a, b).component_classes)
         if name == 'memberOfSheet':
-            target = _strip_slash(arg)
-            return lambda a, b: _strip_slash(pick(a, b).sheet) == target
+            return lambda a, b: pick(a, b).in_footprint and _member_of_sheet(pick(a, b).sheet, arg)
         if name == 'memberOfSheetOrChildren':
-            target = _strip_slash(arg)
-            return lambda a, b: (_strip_slash(pick(a, b).sheet) == target
-                                 or _strip_slash(pick(a, b).sheet).startswith(target + '/'))
+            return lambda a, b: (pick(a, b).in_footprint
+                                 and _member_of_sheet_or_children(pick(a, b).sheet, arg))
         if name == 'memberOfFootprint':
-            m = re.match(r'^\$\{Class:(.+)\}$', arg)
-            if m:
-                cls = m.group(1)
-                self.attrs.add('component_classes')
-                return lambda a, b: cls in pick(a, b).component_classes
-            return lambda a, b: _wild_eq(pick(a, b).fp_ref, arg)
+            return lambda a, b: pick(a, b).in_footprint and _footprint_selector(pick(a, b), arg)
         if name == 'memberOfGroup':
-            return lambda a, b: any(_wild_eq(g, arg) for g in pick(a, b).groups)
+            return lambda a, b: any(_wx_match(g, arg) for g in pick(a, b).groups)
         if name == 'existsOnLayer':
             return lambda a, b: pick(a, b).on_layer(arg)
         if name == 'isPlated':
-            return lambda a, b: pick(a, b).pad_type == 'tht'
+            return lambda a, b: ((pick(a, b).kind == 'pad' and pick(a, b).pad_type == 'tht')
+                                 or pick(a, b).kind == 'via')
         raise UnsupportedRule(name)
 
 
@@ -421,20 +498,56 @@ class _LayerValue:
         return isinstance(other, str) and self.pad.on_layer(other)
 
 
+def _member_of_sheet(sheet: str, ref: str) -> bool:
+    sheet, ref = _strip_slash(sheet), _strip_slash(ref)
+    return _wx_match(sheet, ref) or (ref in ('/', '') and sheet == '')
+
+
+def _member_of_sheet_or_children(sheet: str, ref: str) -> bool:
+    sheet, ref = _strip_slash(sheet), _strip_slash(ref)
+    sheet_path = sheet.split('/')
+    ref_path = ref.split('/')
+    if len(ref_path) > len(sheet_path):
+        return False
+    if ref in ('/', '') and sheet == '':
+        return True
+    return all(_wx_match(s, r) for s, r in zip(sheet_path, ref_path))
+
+
+def _footprint_selector(item: PadInfo, sel: str) -> bool:
+    """KiCad testFootprintSelector(): ${Class:X}, a reference pattern, or a
+    library id pattern ('lib:name')."""
+    if not sel:
+        return False
+    if sel.startswith('$') and sel.endswith('}') and sel.upper().startswith('${CLASS:'):
+        return sel[8:-1] in item.component_classes
+    if _wx_match(item.fp_ref, sel):
+        return True
+    return ':' in sel and _wx_match(item.fp_lib_id, sel)
+
+
 def _truth(v: Any) -> bool:
     if isinstance(v, (_NetClassValue, _LayerValue)):
         return True
+    if isinstance(v, _Undefined):
+        return False
     return bool(v)
 
 
-def _equals(x: Any, y: Any) -> bool:
+def _equals(x: Any, y: Any) -> Optional[bool]:
+    """== between two values; None when either is undefined (then both
+    '==' and '!=' are false, as in KiCad)."""
+    if isinstance(x, _Undefined) or isinstance(y, _Undefined):
+        return None
     if isinstance(x, (_NetClassValue, _LayerValue)):
         return x.equals(y)
-    if isinstance(y, (_NetClassValue, _LayerValue)):
+    if isinstance(y, _NetClassValue):
+        # 'HV' == A.NetClass: KiCad compares with the full name only.
+        return isinstance(x, str) and x.lower() == y.full.lower()
+    if isinstance(y, _LayerValue):
         return y.equals(x)
     if isinstance(x, str) and isinstance(y, str):
-        # The literal (usually on the right) may carry wildcards.
-        return _wild_eq(x, y) if ('*' in y or '?' in y) else _wild_eq(y, x)
+        return _str_eq(x, y)
     return x == y
 
 
@@ -467,6 +580,16 @@ class Rule:
         return _truth(self.evaluator(a, b)) or _truth(self.evaluator(b, a))
 
 
+DEFAULT_COPPER_LAYERS = ('F.Cu', 'B.Cu')
+
+
+def copper_layer_names(count: int) -> Tuple[str, ...]:
+    """Canonical names of a board's copper layers (F.Cu, In1.Cu.., B.Cu)."""
+    if count <= 1:
+        return ('F.Cu',)
+    return ('F.Cu',) + tuple(f'In{i}.Cu' for i in range(1, count - 1)) + ('B.Cu',)
+
+
 @dataclass
 class RuleSet:
     rules: List[Rule] = field(default_factory=list)
@@ -474,6 +597,8 @@ class RuleSet:
     other_rules: int = 0          # rules without isolation constraints (ignored)
     board_min_clearance: int = 0
     source: str = ''
+    copper_layers: Tuple[str, ...] = DEFAULT_COPPER_LAYERS
+    _creepage_cache: Dict[Any, int] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def attrs(self) -> FrozenSet[str]:
@@ -482,25 +607,62 @@ class RuleSet:
             out |= r.attrs
         return frozenset(out)
 
-    def requirement(self, a: PadInfo, b: PadInfo) -> int:
-        """Minimum copper-to-copper distance (nm) required between pads a and b
-        (assumed on different nets): max(clearance, creepage, physical)."""
+    @property
+    def has_creepage(self) -> bool:
+        return any('creepage' in r.constraints for r in self.rules)
+
+    def _lookup(self, a: PadInfo, b: PadInfo, types: Sequence[str]) -> Dict[str, Optional[int]]:
+        """Last matching rule per constraint type (None = severity ignore)."""
         found: Dict[str, Optional[int]] = {}
         for rule in reversed(self.rules):
-            pending = [c for c in rule.constraints if c not in found]
+            pending = [c for c in rule.constraints if c in types and c not in found]
             if not pending:
                 continue
             if rule.matches(a, b):
                 for c in pending:
                     found[c] = rule.constraints[c]
-            if len(found) == len(ISOLATION_CONSTRAINTS):
-                break
+                if len(found) == len(types):
+                    break
+        return found
+
+    def clearance(self, a: PadInfo, b: PadInfo) -> int:
+        """Clearance (and physical clearance) KiCad applies between two items
+        of different nets."""
+        found = self._lookup(a, b, ('clearance', 'physical_clearance'))
         if 'clearance' in found:
             clearance = found['clearance'] or 0
         else:
             clearance = max(a.nc_clearance, b.nc_clearance)
         clearance = max(clearance, self.board_min_clearance)
-        return max(clearance, found.get('creepage') or 0, found.get('physical_clearance') or 0)
+        return max(clearance, found.get('physical_clearance') or 0)
+
+    def creepage(self, a: PadInfo, b: PadInfo) -> int:
+        """Creepage between the nets of a and b: KiCad evaluates it with a
+        stand-in track of each net, on every copper layer; the largest wins."""
+        if not self.has_creepage:
+            return 0
+        key = ((a.net_name, a.netclasses, a.nc_clearance), (b.net_name, b.netclasses, b.nc_clearance))
+        cached = self._creepage_cache.get(key)
+        if cached is not None:
+            return cached
+        best = 0
+        for layer in self.copper_layers or DEFAULT_COPPER_LAYERS:
+            found = self._lookup(net_view(a, layer), net_view(b, layer), ('creepage',))
+            best = max(best, found.get('creepage') or 0)
+        self._creepage_cache[key] = best
+        return best
+
+    def requirement(self, a: PadInfo, b: PadInfo) -> int:
+        """Minimum copper-to-copper distance (nm) required between items a and
+        b (assumed on different nets): max(clearance, physical, creepage).
+        A straight-line gap of at least the creepage distance always
+        satisfies KiCad's creepage check (the path can only be longer).
+        A non-plated hole has no copper: only creepage applies to it (KiCad
+        counts it as an item without net)."""
+        creep = self.creepage(a, b)
+        if (a.kind == 'pad' and a.pad_type == 'npth') or (b.kind == 'pad' and b.pad_type == 'npth'):
+            return creep
+        return max(self.clearance(a, b), creep)
 
     def summary(self) -> Dict[str, int]:
         counts = {c: 0 for c in ISOLATION_CONSTRAINTS}
@@ -510,9 +672,11 @@ class RuleSet:
         return counts
 
 
-def parse_rules(text: str, board_min_clearance: int = 0, source: str = '') -> RuleSet:
+def parse_rules(text: str, board_min_clearance: int = 0, source: str = '',
+                copper_layers: Sequence[str] = DEFAULT_COPPER_LAYERS) -> RuleSet:
     """Parse the content of a .kicad_dru file."""
-    rs = RuleSet(board_min_clearance=board_min_clearance, source=source)
+    rs = RuleSet(board_min_clearance=board_min_clearance, source=source,
+                 copper_layers=tuple(copper_layers))
     try:
         tree = parse_sexpr(text)
     except Exception as e:  # pragma: no cover - defensive
@@ -562,11 +726,14 @@ def parse_rules(text: str, board_min_clearance: int = 0, source: str = '') -> Ru
     return rs
 
 
-def load_rules_file(path: str, board_min_clearance: int = 0) -> RuleSet:
+def load_rules_file(path: str, board_min_clearance: int = 0,
+                    copper_layers: Sequence[str] = DEFAULT_COPPER_LAYERS) -> RuleSet:
     """Read a .kicad_dru file; a missing file gives an empty rule set."""
     try:
         with open(path, 'r', encoding='utf-8') as f:
             text = f.read()
     except OSError:
-        return RuleSet(board_min_clearance=board_min_clearance, source='')
-    return parse_rules(text, board_min_clearance=board_min_clearance, source=path)
+        return RuleSet(board_min_clearance=board_min_clearance, source='',
+                       copper_layers=tuple(copper_layers))
+    return parse_rules(text, board_min_clearance=board_min_clearance, source=path,
+                       copper_layers=copper_layers)

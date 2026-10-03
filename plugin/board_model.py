@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Set, Optional, FrozenSet
 
-from .rules import PadInfo, RuleSet, load_rules_file
+from .rules import PadInfo, RuleSet, copper_layer_names, load_rules_file
 from .isolation import IsolationModel, build_isolation_model
 
 
@@ -306,6 +306,72 @@ def _group_chain(fp) -> Tuple[str, ...]:
     return tuple(names)
 
 
+def _lib_id(fp) -> str:
+    try:
+        return str(fp.GetFPIDAsString())
+    except Exception:
+        return ''
+
+
+def net_class_names(item) -> Tuple[str, ...]:
+    """Constituent net classes of a pad / track ('HV,Default' -> ('HV', 'Default'))."""
+    try:
+        return tuple(n.strip() for n in str(item.GetNetClassName()).split(',')
+                     if n.strip()) or ('Default',)
+    except Exception:
+        return ('Default',)
+
+
+def pad_rule_info(pcbnew, pad, attr, side: str, ref: str, lib_id: str, sheet: str,
+                  classes: Tuple[str, ...], groups: Tuple[str, ...], nc_clearance) -> PadInfo:
+    """What the design rules can see of a pad. A non-plated hole (no copper,
+    no net) only matters for creepage."""
+    if attr == getattr(pcbnew, 'PAD_ATTRIB_NPTH', -1):
+        pad_type, layers = 'npth', ('*.Cu',)
+    elif attr == getattr(pcbnew, 'PAD_ATTRIB_PTH', -2):
+        pad_type, layers = 'tht', ('*.Cu',)
+    else:
+        pad_type = 'conn' if attr == getattr(pcbnew, 'PAD_ATTRIB_CONN', -3) else 'smd'
+        try:
+            on_b = pad.GetLayerSet().Contains(pcbnew.B_Cu)
+            on_f = pad.GetLayerSet().Contains(pcbnew.F_Cu)
+        except Exception:
+            on_f, on_b = side == 'F', side == 'B'
+        layers = tuple(l for l, on in (('F.Cu', on_f), ('B.Cu', on_b)) if on) or ('F.Cu',)
+    nc_names = net_class_names(pad)
+    return PadInfo(
+        net_name=str(pad.GetNetname()),
+        netclasses=nc_names,
+        nc_clearance=nc_clearance(nc_names),
+        fp_ref=ref,
+        fp_lib_id=lib_id,
+        component_classes=classes,
+        sheet=sheet,
+        groups=groups,
+        pad_type=pad_type,
+        layers=layers,
+        kind='pad',
+    )
+
+
+def board_copper_layers(board) -> Tuple[str, ...]:
+    try:
+        return copper_layer_names(int(board.GetCopperLayerCount()))
+    except Exception:
+        return copper_layer_names(2)
+
+
+def load_board_rules(board) -> RuleSet:
+    """Custom rules of the board's project, with its minimum clearance and
+    copper layers."""
+    try:
+        min_clr = int(board.GetDesignSettings().m_MinClearance)
+    except Exception:
+        min_clr = 0
+    return load_rules_file(_rules_path(board), board_min_clearance=min_clr,
+                           copper_layers=board_copper_layers(board))
+
+
 def _component_classes(fp) -> Tuple[str, ...]:
     try:
         s = str(fp.GetComponentClassAsString())
@@ -404,6 +470,7 @@ def extract_board_model(board, selected_only: bool = False,
             sheet = ''
         classes = _component_classes(fp)
         groups = _group_chain(fp)
+        lib_id = _lib_id(fp)
 
         pads_list = []
         fp_net_codes: Set[int] = set()
@@ -484,8 +551,6 @@ def extract_board_model(board, selected_only: bool = False,
 
             # --- Isolation data: copper box of the pad, at footprint 0° ---
             if use_isolation:
-                if attr == getattr(pcbnew, 'PAD_ATTRIB_NPTH', -1):
-                    continue
                 try:
                     bb = pad.GetBoundingBox()
                     bcx = bb.GetX() + bb.GetWidth() / 2.0
@@ -505,32 +570,8 @@ def extract_board_model(board, selected_only: bool = False,
                     # Non-orthogonal footprint: keep a box that covers the pad
                     # whatever the rotation (conservative).
                     hx = hy = math.hypot(hw, hh)
-                if attr == getattr(pcbnew, 'PAD_ATTRIB_PTH', -2):
-                    pad_type, layers = 'tht', ('*.Cu',)
-                else:
-                    pad_type = 'conn' if attr == getattr(pcbnew, 'PAD_ATTRIB_CONN', -3) else 'smd'
-                    try:
-                        on_b = pad.GetLayerSet().Contains(pcbnew.B_Cu)
-                        on_f = pad.GetLayerSet().Contains(pcbnew.F_Cu)
-                    except Exception:
-                        on_f, on_b = side == 'F', side == 'B'
-                    layers = tuple(l for l, on in (('F.Cu', on_f), ('B.Cu', on_b)) if on) or ('F.Cu',)
-                try:
-                    nc_names = tuple(n.strip() for n in str(pad.GetNetClassName()).split(',')
-                                     if n.strip()) or ('Default',)
-                except Exception:
-                    nc_names = ('Default',)
-                info = PadInfo(
-                    net_name=pad.GetNetname(),
-                    netclasses=nc_names,
-                    nc_clearance=nc_clearance(nc_names),
-                    fp_ref=ref,
-                    component_classes=classes,
-                    sheet=sheet,
-                    groups=groups,
-                    pad_type=pad_type,
-                    layers=layers,
-                )
+                info = pad_rule_info(pcbnew, pad, attr, side, ref, lib_id, sheet, classes,
+                                     groups, nc_clearance)
                 iso_pads.append((i, j, nc, info, box_ox, box_oy, int(hx), int(hy)))
 
         # Also expand extents from the courtyard outline.
@@ -778,11 +819,7 @@ def extract_board_model(board, selected_only: bool = False,
     # Isolation rules: net-class clearances + custom rules (.kicad_dru)
     isolation: Optional[IsolationModel] = None
     if use_isolation:
-        try:
-            min_clr = int(board.GetDesignSettings().m_MinClearance)
-        except Exception:
-            min_clr = 0
-        rules = load_rules_file(_rules_path(board), board_min_clearance=min_clr)
+        rules = load_board_rules(board)
         for rname, reason in rules.unsupported:
             warnings.append(f"Rule '{rname}' ignored: {reason}")
         isolation = build_isolation_model(iso_pads, rules, ISOLATION_THRESHOLD)

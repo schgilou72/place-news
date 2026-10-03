@@ -1,12 +1,17 @@
-"""place-news — placement optimizer for KiCad, aware of isolation rules.
+"""place-news — placement optimizer and isolation-aware autorouting for KiCad.
 
 Derived from CadMust-Neo by Remi Blokker (MIT licence).
 """
-__version__ = "0.2.0"
+import os
 
-try:
-    from .place_news_action import PlaceNewsAction
-    PlaceNewsAction().register()
-except ImportError:
-    # Running outside KiCad (e.g., unit tests) — pcbnew not available
-    pass
+__version__ = "0.3.0"
+
+if not os.environ.get('PLACE_NEWS_NO_REGISTER'):
+    try:
+        from .place_news_action import PlaceNewsAction
+        PlaceNewsAction().register()
+        from .route_action import PlaceNewsRouteAction
+        PlaceNewsRouteAction().register()
+    except ImportError:
+        # Running outside KiCad (e.g., unit tests) — pcbnew not available
+        pass

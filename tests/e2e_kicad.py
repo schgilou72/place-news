@@ -1,9 +1,12 @@
 """End-to-end check against a real KiCad installation (pcbnew + kicad-cli).
 
-Builds a small switch-mode power supply board (primary / secondary, HV net
-class, creepage rule, placement area, keep-outs, duplicate references),
-scrambles the placement, runs the optimizer, then asks KiCad's own DRC whether
-the result respects courtyards, clearance, creepage and keep-outs.
+Builds a small isolated flyback board (HV / primary / secondary net classes,
+reinforced-isolation creepage and clearance rules, placement area, keep-outs,
+duplicate references), scrambles the placement, runs the optimizer, then asks
+KiCad's own DRC whether the result respects courtyards, clearance, creepage
+and keep-outs. When Java 25+ and a Freerouting jar are available, the placed
+board is also routed through place-news' Specctra round trip and checked
+again.
 
 Run with KiCad's Python, e.g.:  python3 -m unittest tests.e2e_kicad -v
 Skipped automatically when pcbnew or kicad-cli is not available.
@@ -34,22 +37,31 @@ PRO = {
         "classes": [
             {"name": "Default", "clearance": 0.2, "track_width": 0.25, "via_diameter": 0.6,
              "via_drill": 0.3, "priority": 2147483647},
-            {"name": "HV", "clearance": 1.0, "track_width": 0.5, "via_diameter": 0.8,
+            {"name": "HV", "clearance": 0.6, "track_width": 0.5, "via_diameter": 0.8,
              "via_drill": 0.4, "priority": 0},
+            {"name": "PRI", "clearance": 0.25, "track_width": 0.3, "via_diameter": 0.6,
+             "via_drill": 0.3, "priority": 1},
+            {"name": "SEC", "clearance": 0.2, "track_width": 0.4, "via_diameter": 0.6,
+             "via_drill": 0.3, "priority": 2},
         ],
-        "netclass_patterns": [{"netclass": "HV", "pattern": p} for p in
-                              ("HV_*", "SW", "GATE*", "PRI_*", "FB_P", "CS", "RT")],
+        "netclass_patterns": (
+            # HV: the rectified bus and the switch node; the primary return
+            # (HV_BUS-) is the reference of the primary-side control circuit.
+            [{"netclass": "HV", "pattern": p} for p in ("HV_BUS+", "SW")]
+            + [{"netclass": "PRI", "pattern": p} for p in ("HV_BUS-", "GATE*", "PRI_*", "FB_P",
+                                                            "CS", "RT")]
+            + [{"netclass": "SEC", "pattern": p} for p in ("SEC_*", "VOUT", "GND", "FB_S")]),
     },
 }
 
 DRU = """(version 1)
-# Reinforced isolation between the primary (HV) side and everything else
-(rule "HV creepage"
+# Reinforced isolation between the primary side (HV, PRI) and the secondary side
+(rule "isolation creepage"
   (constraint creepage (min 6mm))
-  (condition "A.hasNetclass('HV') && !B.hasNetclass('HV')"))
-(rule "HV clearance"
+  (condition "(A.hasNetclass('HV') || A.hasNetclass('PRI')) && B.hasNetclass('SEC')"))
+(rule "isolation clearance"
   (constraint clearance (min 4mm))
-  (condition "A.hasNetclass('HV') && !B.hasNetclass('HV')"))
+  (condition "(A.hasNetclass('HV') || A.hasNetclass('PRI')) && B.hasNetclass('SEC')"))
 """
 
 
@@ -90,6 +102,10 @@ LIBRARY = {
     'SOIC8': _fp('SOIC8', _crtyd_rect(-3.7, -2.7, 3.7, 2.7)
                  + ''.join(_smd(n + 1, -2.7, y, 1.5, 0.6) for n, y in enumerate((-1.905, -0.635, 0.635, 1.905)))
                  + ''.join(_smd(8 - n, 2.7, y, 1.5, 0.6) for n, y in enumerate((-1.905, -0.635, 0.635, 1.905)))),
+    # Wide-body optocoupler: 10 mm between the input and output pin rows.
+    'OPTO4W': _fp('OPTO4W', _crtyd_rect(-6.3, -2.6, 6.3, 2.6)
+                  + _smd(1, -5.0, -1.27, 1.5, 0.8) + _smd(2, -5.0, 1.27, 1.5, 0.8)
+                  + _smd(3, 5.0, 1.27, 1.5, 0.8) + _smd(4, 5.0, -1.27, 1.5, 0.8)),
     'TB2': _fp('TB2', _crtyd_rect(-2.8, -4, 7.9, 4) + _tht(1, 0, 0, 2.5, 1.3, 'rect')
                + _tht(2, 5.08, 0, 2.5, 1.3)),
     'MH3': _fp('MH3', '  (fp_circle (center 0 0) (end 3.5 0) (stroke (width 0.05) (type default))'
@@ -108,7 +124,7 @@ PARTS = [
                                   5: 'CS', 6: 'RT'}),
     ('R1', 'R0805', '/Primary/', {1: 'GATE_DRV', 2: 'GATE'}),
     ('C3', 'R0805', '/Primary/', {1: 'PRI_VCC', 2: 'HV_BUS-'}),
-    ('U2', 'SOIC8', '/Primary/', {1: 'FB_P', 2: 'HV_BUS-', 7: 'FB_S', 8: 'GND'}),
+    ('U2', 'OPTO4W', '/Primary/', {1: 'FB_P', 2: 'HV_BUS-', 3: 'GND', 4: 'FB_S'}),
     ('D1', 'TO220', '/Secondary/', {1: 'SEC_A', 2: 'VOUT', 3: 'SEC_B'}),
     ('C2', 'CAP_D10', '/Secondary/', {1: 'VOUT', 2: 'GND'}),
     ('J2', 'TB2', '/Secondary/', {1: 'VOUT', 2: 'GND'}),
@@ -229,21 +245,49 @@ def same_footprint(v):
     return len(owners) == 2 and owners[0] == owners[1]
 
 
+def place_board(workdir):
+    """Build the test board, run the optimizer and the silkscreen pass, save."""
+    from plugin.board_model import extract_board_model
+    from plugin.annealer import run_sa, SAConfig
+    from plugin.placement import apply_model_to_board
+    from plugin.silkscreen import extract_silkscreen_model, place_silkscreen, apply_silkscreen
+
+    random.seed(11)
+    board, path = build_board(workdir)
+    model = extract_board_model(board)
+    run_sa(model, SAConfig(max_iterations=120, reheat_count=2))
+    apply_model_to_board(board, model)
+    verify = extract_board_model(board)
+    silk = extract_silkscreen_model(board, verify)
+    apply_silkscreen(board, silk, place_silkscreen(silk), board_model=verify)
+    pcbnew.SaveBoard(path, board, True)
+    return board, path, model
+
+
+def isolation_violations(violations):
+    return [v['description'] + ' | ' + ' / '.join(i['description'] for i in v['items'])
+            for v in violations if v['type'] in ('clearance', 'creepage')]
+
+
+def _freerouting():
+    """(java, jar) when Freerouting can run here, else None."""
+    from plugin import specctra
+    jar = os.environ.get('PLACE_NEWS_FREEROUTING_JAR') or specctra.find_freerouting_jar()
+    java, version = specctra.find_java()
+    if jar and os.path.isfile(jar) and java and version >= specctra.MIN_JAVA:
+        return java, jar
+    return None
+
+
 @unittest.skipUnless(HAVE_PCBNEW and KICAD_CLI, 'needs KiCad (pcbnew module and kicad-cli)')
 class TestEndToEnd(unittest.TestCase):
     def test_smps_board(self):
         from plugin.board_model import extract_board_model
-        from plugin.annealer import run_sa, SAConfig
         from plugin.cost_function import CostState
-        from plugin.placement import apply_model_to_board
         from plugin.isolation import list_violations
 
-        random.seed(11)
         workdir = tempfile.mkdtemp(prefix='place-news-e2e-')
         board, path = build_board(workdir)
-
-        from plugin.silkscreen import extract_silkscreen_model, place_silkscreen, apply_silkscreen
-
         model = extract_board_model(board)
         self.assertEqual(model.warnings, [])
         self.assertTrue(model.isolation is not None and model.isolation.active)
@@ -257,16 +301,15 @@ class TestEndToEnd(unittest.TestCase):
         r1 = next(f for f in model.footprints if f.reference == 'R1')
         self.assertEqual(t1.copper_sides, ('B', 'F'))
         self.assertEqual(r1.copper_sides, ('F',))
+        # Every part can meet the rules by itself (wide-body opto, split transformer).
+        self.assertEqual([v for v in list_violations(model.isolation, model.footprints)
+                          if v.fp_a == v.fp_b], [])
 
-        run_sa(model, SAConfig(max_iterations=120, reheat_count=2))
+        board, path, model = place_board(workdir)
         cs = CostState(model, quiet=True)
         self.assertEqual(cs.area_violations(), [])
         self.assertAlmostEqual(cs._keepout_penalty, 0.0, delta=1.0)
-        apply_model_to_board(board, model)
-        verify = extract_board_model(board)
-        silk = extract_silkscreen_model(board, verify)
-        apply_silkscreen(board, silk, place_silkscreen(silk), board_model=verify)
-        pcbnew.SaveBoard(path, board, True)
+        self.assertEqual(list_violations(model.isolation, model.footprints), [])
 
         # The two 'MH' footprints must both have been placed (UUID mapping).
         reloaded = pcbnew.LoadBoard(path)
@@ -276,33 +319,47 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(positions, expected)
 
         violations = run_drc(path)
-        by_type = {}
+        report = {}
         for v in violations:
-            by_type.setdefault(v['type'], []).append(v)
-        report = {t: len(vs) for t, vs in by_type.items()}
+            report[v['type']] = report.get(v['type'], 0) + 1
         print('\nKiCad DRC after placement:', report)
+        self.assertNotIn('courtyards_overlap', report)
+        self.assertNotIn('items_not_allowed', report)
+        self.assertEqual(isolation_violations(violations), [])
+        shutil.rmtree(workdir, ignore_errors=True)
 
-        self.assertNotIn('courtyards_overlap', by_type, by_type.get('courtyards_overlap'))
-        self.assertNotIn('items_not_allowed', by_type, by_type.get('items_not_allowed'))
-        for t in ('clearance', 'creepage'):
-            between = [v['description'] + ' | ' + ' / '.join(i['description'] for i in v['items'])
-                       for v in by_type.get(t, []) if not same_footprint(v)]
-            # KiCad 10 also measures creepage from pads to rule-area outlines
-            # (rule areas have no net class, so "!B.hasNetclass('HV')" matches).
-            # A rule area is not a conductor; the placer does not model this.
-            vs_rule_area = [b for b in between if 'Rule area' in b]
-            print(f'{t}: {len(vs_rule_area)} vs rule areas (KiCad quirk):', vs_rule_area[:5])
-            between = [b for b in between if 'Rule area' not in b]
-            self.assertEqual(between, [], f'{t} violations between footprints')
-        # The opto (U2) is too small for 6 mm: KiCad and the optimizer both
-        # flag it as a footprint problem, not a placement one.
-        intra_kicad = [v for v in by_type.get('creepage', []) if same_footprint(v)]
-        self.assertTrue(intra_kicad)
-        intra_ours = [v for v in list_violations(model.isolation, model.footprints) if v.fp_a == v.fp_b]
-        self.assertTrue(intra_ours)
-        self.assertTrue(all(model.footprints[v.fp_a].reference in ('U2', 'T1', 'U1', 'Q1', 'R4', 'C3',
-                                                                    'R1', 'J1', 'C1')
-                            for v in intra_ours))
+    def test_route_with_isolation(self):
+        from plugin import specctra
+        tools = _freerouting()
+        if not tools:
+            self.skipTest('needs Java 25+ and a Freerouting jar (PLACE_NEWS_FREEROUTING_JAR)')
+        java, jar = tools
+        workdir = tempfile.mkdtemp(prefix='place-news-route-')
+        board, path, _model = place_board(workdir)
+        dsn = os.path.join(workdir, 'smps.dsn')
+        ses = os.path.join(workdir, 'smps.ses')
+        rep = specctra.export_dsn(board, dsn, use_isolation=True)
+        # Footprint keep-outs and the placement area must not block routing.
+        self.assertEqual(rep.keepouts['removed'], 4)
+        self.assertEqual(rep.keepouts['unmatched'], 0)
+        # DSN class names are the effective net classes, e.g. 'HV,Default'.
+        pairs = {frozenset(n.split(',')[0] for n in k): v for k, v in rep.classes.pairs.items()}
+        self.assertEqual(pairs.get(frozenset(('HV', 'SEC'))), 6_000_000)
+        self.assertEqual(pairs.get(frozenset(('PRI', 'SEC'))), 6_000_000)
+        result = specctra.run_freerouting(java, jar, dsn, ses, passes=10)
+        self.assertTrue(result.ok, '\n'.join(result.log[-20:]))
+        self.assertTrue(specctra.import_ses(board, ses))
+        pcbnew.SaveBoard(path, board, True)
+        self.assertGreater(len(board.GetTracks()), 20)
+        violations = run_drc(path)
+        report = {}
+        for v in violations:
+            report[v['type']] = report.get(v['type'], 0) + 1
+        print('\nFreerouting:', result.unrouted, 'unrouted;', 'KiCad DRC after routing:', report)
+        self.assertEqual(isolation_violations(violations), [])
+        # Blocked rule areas used to leave 5+ connections unrouted on this board.
+        self.assertIsNotNone(result.unrouted)
+        self.assertLessEqual(result.unrouted, 1)
         shutil.rmtree(workdir, ignore_errors=True)
 
 
