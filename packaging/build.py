@@ -15,7 +15,8 @@ PLUGIN = os.path.join(ROOT, 'plugin')
 DIST = os.path.join(ROOT, 'dist')
 
 # Files of plugin/ that are not shipped (runtime state, caches).
-SKIP = {'settings.json', 'route_settings.json', 'debug.log', 'profile.log'}
+SKIP = {'settings.json', 'route_settings.json', 'sourcing.json', 'sourcing-cache.json', 'debug.log',
+        'profile.log'}
 
 IDENTIFIER = 'local.place-news'   # set the final reverse-DNS id before publishing
 
@@ -39,10 +40,11 @@ def metadata(ver: str) -> dict:
         "$schema": "https://go.kicad.org/pcm/schemas/v1",
         "name": "place-news",
         "description": "Component placement, Freerouting autorouting and a ground pour that "
-                       "respect clearance and creepage rules (power electronics, HV), with "
-                       "an aesthetic and cost check that learns your taste.",
+                       "respect clearance and creepage rules (power electronics, HV), an "
+                       "aesthetic and cost check that learns your taste, and BOM sourcing at "
+                       "DigiKey, Mouser, Farnell, TME and LCSC.",
         "description_full": (
-            "place-news adds three actions to the PCB editor.\n\n"
+            "place-news adds four actions to the PCB editor.\n\n"
             "Placement: simulated annealing that minimises wirelength while keeping "
             "pads as far apart as the net-class clearances and the custom rules "
             "(clearance, creepage, physical_clearance in the .kicad_dru file) "
@@ -59,6 +61,15 @@ def metadata(ver: str) -> dict:
             "Aesthetic check: placement, routing and cost criteria, numbered markers "
             "and an HTML report, a layer-count estimate (routing room per net, BGA "
             "escape), and learning from your opinion and your corrections.\n\n"
+            "Sourcing (BOM): stock, price breaks, minimum order and multiple, "
+            "lifecycle and replacements of every BOM line at DigiKey, Mouser, "
+            "Farnell, TME (beta) and LCSC, with your own free API keys (LCSC needs "
+            "none). Search by MPN, by distributor part number or, for resistors, "
+            "capacitors and inductors, by value, package and ratings (same package, "
+            "ratings kept). The chosen parts are written into the components' fields "
+            "(MPN, manufacturer, distributor part numbers, ratings), and saved as a "
+            "BOM with the designators, unit prices and minimum orders, plus one order "
+            "list per distributor (designators as customer reference).\n\n"
             "Derived from CadMust-Neo by Remi Blokker (MIT)."),
         "identifier": IDENTIFIER,
         "type": "plugin",
@@ -66,7 +77,7 @@ def metadata(ver: str) -> dict:
         "license": "MIT",
         "resources": {},
         "tags": ["placement", "autorouter", "freerouting", "creepage", "clearance",
-                 "power-electronics", "ground-plane", "design-check"],
+                 "power-electronics", "ground-plane", "design-check", "bom", "sourcing"],
         "versions": [{"version": ver, "status": "testing", "kicad_version": "10.0"}],
     }
 

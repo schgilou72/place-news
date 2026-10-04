@@ -17,8 +17,13 @@ supplies, mains and high-voltage circuits):
   placement and routing, marks every issue on the board and in a visual
   report, estimates how many layers the board needs, and learns your taste
   from your opinion and from your own corrections.
+- **place-news — Sourcing (BOM)** — stock, prices, minimum orders, lifecycle
+  and replacements of every BOM line at DigiKey, Mouser, Farnell, TME and
+  LCSC; the chosen parts written into the components' fields, a BOM with the
+  designators, unit prices and minimum orders, and one order list per
+  distributor.
 
-KiCad's own DRC stays the judge: both actions can finish with a DRC run, and the
+KiCad's own DRC stays the judge: placement and routing can finish with a DRC run, and the
 rules are always applied on the safe side (straight-line distance, never longer
 than KiCad's creepage path).
 
@@ -34,6 +39,8 @@ by Remi Blokker (MIT licence).
   [Freerouting releases](https://github.com/freerouting/freerouting/releases)
   or installed by KiCad's Freerouting plugin). Java: e.g.
   [Eclipse Temurin](https://adoptium.net/temurin/releases/).
+- For sourcing: an internet connection, and the free API keys of the
+  distributors you use (LCSC needs none).
 - Nothing else: pure Python, no extra packages.
 
 ## Installation
@@ -45,12 +52,12 @@ Manager → Install from File…* and choose `place-news-<version>-pcm.zip`.
 Directory*, copy the `plugin/` folder there as `place_news/`, then *Tools →
 External Plugins → Refresh Plugins*.
 
-Three toolbar buttons appear: placement (green grid), routing (trace with a
-dashed isolation line) and the aesthetic check (magnifier).
+Four toolbar buttons appear: placement (green grid), routing (trace with a
+dashed isolation line), the aesthetic check (magnifier) and sourcing (cart).
 
 To try it: open `examples/flyback/flyback.kicad_pcb` (an isolated flyback
 with HV / PRI / SEC net classes and 6 mm creepage rules, parts still piled up)
-and run both actions.
+and run the placement and the routing.
 
 ## Placement
 
@@ -244,6 +251,117 @@ for comparison; they ask for far too many layers on fine-pitch SMD boards:
 | video | 2 + 2 planes | 0.30 → 8 signal | 74 % → "6–8" | 7.3 | 2 fit |
 | vme-wren (FPGA BGA) | 12 | 0.11 → 10 signal | 63 % | 19 | 8 routing (BGA escape) |
 
+## Sourcing (BOM)
+
+**place-news — Sourcing (BOM)** asks the distributors, for every line of the
+bill of materials, for the stock, the price breaks, the minimum order and the
+multiple, the lifecycle (active, NRND, end of life, obsolete) and the
+replacements; then it writes the chosen parts into the components and saves a
+BOM and one order list per distributor.
+
+### Keys
+
+Each distributor has a free API for its catalogue. Create your own keys once
+and enter them in the dialog; the *Test* button next to each one tells at once
+whether it works.
+
+| Distributor | What to create (free) | Where |
+|---|---|---|
+| DigiKey | an app with *Product Information v4*, client credentials: client ID and secret | [developer.digikey.com](https://developer.digikey.com) |
+| Mouser | a *Search API* key | [mouser.com/api-hub](https://www.mouser.com/api-hub/) |
+| Farnell / element14 | a *Product Search API* key (store: `fr.farnell.com` by default) | [partner.element14.com](https://partner.element14.com) |
+| TME (beta) | an API v2 application: token and secret | [developers.tme.eu](https://developers.tme.eu) |
+| LCSC | nothing: JLCPCB / LCSC public catalogue | — |
+
+The keys stay in your KiCad settings folder (`place-news/sourcing.json`,
+readable by you only) and only go to the distributor they belong to. Answers
+are kept one day (`place-news/sourcing-cache.json`): running again is quick
+and spares the daily quotas (Mouser: 1000 calls a day, 30 a minute — place-news
+paces its calls).
+
+### What is searched
+
+Footprints with the same value, footprint, MPN, manufacturer and ratings
+fields (Voltage, Tolerance, Power, Dielectric…) make one BOM line. DNP parts,
+parts excluded from the BOM, mounting holes and fiducials are left out (and
+listed in the report). For each line:
+
+- **with an MPN field** (`MPN`, `Manufacturer_Part_Number`, `MFR_PN`, KiCost's
+  `manf#`… any usual spelling): that part at every distributor;
+- **with a distributor part number** (fields `DigiKey`, `Mouser`, `Farnell`,
+  `TME`, `LCSC`, e.g. `LCSC = C25804`): that part, then its MPN at the others;
+- **no MPN, but a value that is a part name** (`IRF840`, `UC3843BD1R2G`):
+  searched as a part number;
+- **no MPN, a resistor, capacitor or inductor**: searched by value, package
+  and ratings. Only parts that fit are *proposed*: same package (read from the
+  footprint: chip size, SOT / TO / SOIC with their pin count and isolated
+  tab, radial diameter and pitch, axial length, …), same value, voltage,
+  current and power at least as high, tolerance at most as wide, dielectric
+  as good (C0G > X7R > X5R), safety class as good (Y1 > Y2 > X1 > X2). Without a
+  tolerance in the schematic, resistors are 1 % and chip capacitors X5R or
+  better (settings). A package or a rating that cannot be read is not
+  accepted: a proposal is never a guess — give an MPN for such parts;
+- any other part without a part number is reported "not found: needs a part
+  number".
+
+The package is checked for parts found by part number too: one MPN can be
+sold in several package variants (LCSC lists PC817C in DIP-4 and in SMD-4P),
+so the variant that fits the footprint is bought, and a part whose package
+does not fit is flagged *check package*. Same pin count is not enough where
+it does not fix the size: QFN / DFN / QFP bodies (QFN-32 5×5 or 7×7) and DIP
+row spacings (300 or 600 mil) are compared when both sides give them.
+
+### What is bought
+
+- **Quantity**: per board × number of boards + spare parts (10 % by default,
+  rounded up), then raised to the **minimum order**, rounded to the
+  **multiple** (reels, cut tape) and priced at the **price break** reached.
+  Lines buying the same part share one order (one minimum, one multiple).
+- **Where**: the first distributor of *your list* (drag to reorder, untick to
+  skip) that has the stock for the quantity actually bought — or, as an
+  option, wherever the line total is the lowest. Never an obsolete part when
+  there is another.
+- **No surprise**: each line shows the unit price, the minimum order and the
+  multiple, the line total, and the money spent beyond the need because of
+  minimum orders; the totals are per distributor and per board. Prices are
+  dated, in euros, excluding VAT and shipping; prices in another currency
+  (LCSC: US dollars) are converted at the ECB rate of the day.
+- **Replacements**: when a part is short, at the end of its life or not
+  found, the distributors' own suggestions (DigiKey substitutes, Mouser
+  suggested replacement, TME similar products, LCSC alternatives) and a
+  search by parameters at every distributor give replacements with the same
+  package and the ratings kept, in stock for the quantity bought.
+
+The results dialog colours each line by status (OK, short stock, end of life,
+proposed, not found, check package). Select a line to see every offer,
+proposal and replacement; double-click one to use it.
+
+### What you get
+
+- **Write into the components**: fields `MPN`, `Manufacturer`, the part
+  number at each distributor that carries the part (`DigiKey`, `Mouser`,
+  `Farnell`, `TME`, `LCSC`) and the key parameters (`Voltage`, `Current`,
+  `Power`, `Tolerance`, `Dielectric`, `Safety class` — only where the field is
+  empty: your figures are kept). New fields are hidden, on the fabrication
+  layer. To bring them into the schematic: *Tools → Update Schematic from
+  PCB*, tick *Other fields*. *Edit → Undo* removes them from the board.
+- **Save the BOM and the order lists**, next to the board:
+  - `<board>-bom.csv` — designators, quantity per board / needed / ordered,
+    value, package, footprint, manufacturer, MPN, distributor and part
+    number, unit price, minimum order, multiple, line total, extra due to the
+    minimum order, stock, lifecycle, lead time, status, replacements, link
+    (`;` and decimal commas: opens as is in a French Excel);
+  - `<board>-order-<distributor>.csv` — part number, quantity, customer
+    reference (the designators; DigiKey and Mouser print it on each bag's
+    label), MPN, manufacturer, unit price, minimum, multiple, total: upload it
+    in the distributor's BOM / list tool (map the columns once);
+  - `<board>-sourcing.html` — the report: totals, statuses and every line with
+    its choices.
+
+Tried live with LCSC; DigiKey, Mouser, Farnell and TME are tested on answers
+shaped like their documented APIs — use the *Test* buttons with your keys.
+TME's API v2 is new: its support is marked beta.
+
 ## Tips
 
 - Give the high-voltage and the isolated sides their own net classes (e.g. HV,
@@ -259,10 +377,10 @@ for comparison; they ask for far too many layers on fine-pitch SMD boards:
 
 ```bash
 python3 -m unittest tests.test_optimizer tests.test_rules_isolation tests.test_routing \
-  tests.test_aesthetics tests.test_cost -v
+  tests.test_aesthetics tests.test_cost tests.test_sourcing -v
 ```
 
-These need no KiCad. With KiCad's Python (`pcbnew`, `kicad-cli`) the
+These need no KiCad and no network (the distributors' answers are canned). With KiCad's Python (`pcbnew`, `kicad-cli`) the
 end-to-end tests build an isolated flyback board, place it, check it with
 KiCad's DRC, route it through Freerouting, pour GND on the top layer and check
 again, and try the outer layers of a 4-layer version:
@@ -273,6 +391,7 @@ PLACE_NEWS_FREEROUTING_JAR=/path/to/freerouting-2.4.1-executable.jar \
 xvfb-run -a python3 tests/gui_smoke.py          # placement action, dialogs included
 xvfb-run -a python3 tests/gui_route_smoke.py    # routing action, dialogs included
 xvfb-run -a python3 tests/gui_check_smoke.py    # aesthetic check and learning
+xvfb-run -a python3 tests/gui_sourcing_smoke.py # sourcing with LCSC (network)
 ```
 
 (The GUI scripts need the Python that KiCad's wxPython was built for.)
