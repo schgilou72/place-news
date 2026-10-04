@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from . import specctra
 
@@ -71,13 +71,17 @@ def progress_text(line: str) -> str:
 
 def summarize_result(result: specctra.RouteResult, export: Optional[specctra.ExportReport],
                      drc: Optional[specctra.DrcSummary], elapsed: float,
-                     drc_requested: bool, zones_refilled: bool = False) -> List[str]:
+                     drc_requested: bool, zones_refilled: bool = False,
+                     notes: Sequence[str] = ()) -> List[str]:
     lines = [f'Routing finished in {elapsed:.0f} s.']
     if result.unrouted is not None:
         lines.append(f'  Connections left unrouted: {result.unrouted}')
         lines.append(f'  Freerouting clearance violations: {result.violations}')
     if zones_refilled:
         lines.append('  Zones refilled.')
+    if notes:
+        lines.append('')
+        lines += list(notes)
     if export is not None:
         rules = describe_class_rules(export.classes)
         if export.rules is not None:

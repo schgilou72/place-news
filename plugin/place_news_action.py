@@ -323,7 +323,7 @@ class _ResultsDialog(wx.Dialog):
                  n_overlaps, n_keepout, n_silk_moved, elapsed, total_moves,
                  accepted_moves, iso_checked=False, iso_lines=(), n_iso_internal=0,
                  internal_refs=(), n_iso_fixed=0, n_areas=0, n_area_violations=0,
-                 alignment=None):
+                 alignment=None, untangle=None):
         super().__init__(parent, title="place-news \u2014 Results",
                          style=wx.DEFAULT_DIALOG_STYLE)
 
@@ -431,6 +431,26 @@ class _ResultsDialog(wx.Dialog):
             else:
                 align_msg = "nothing to align"
             add_metric(self._DASH, grey, "Rows / columns", align_msg)
+            if getattr(alignment, 'rotated', 0):
+                add_metric(self._DASH, grey, "Orientation",
+                           f"{alignment.rotated} part(s) turned like their siblings")
+
+        # Untangled ratsnest (cost: fewer vias)
+        if untangle is not None:
+            if untangle.swaps or untangle.flips:
+                moves = []
+                if untangle.swaps:
+                    moves.append(f"{untangle.swaps} swap(s)")
+                if untangle.flips:
+                    moves.append(f"{untangle.flips} part(s) turned round")
+                extra = (untangle.hpwl_after - untangle.hpwl_before) / 1e6
+                add_metric(self._CHECK, green, "Ratsnest crossings",
+                           f"{untangle.crossings_before} \u2192 {untangle.crossings_after}  "
+                           f"({', '.join(moves)}, {extra:+.1f} mm wire)")
+            else:
+                add_metric(self._DASH, grey, "Ratsnest crossings",
+                           f"{untangle.crossings_before} (no swap found that removes one)"
+                           if untangle.crossings_before else "none")
 
         # Silkscreen (neutral — always informational)
         silk_msg = (f"{n_silk_moved} refs centred / repositioned" if n_silk_moved > 0
@@ -709,6 +729,8 @@ class PlaceNewsAction(pcbnew.ActionPlugin):
             dlg.Destroy()
             return
         config = dlg.build_config()
+        # Learned aesthetic policy (with a little exploration)
+        learner, policy_eps = _apply_learned_policy(config)
         selected_only = dlg.move_selected_only
         excluded_net_names = dlg.excluded_net_names
         use_isolation = dlg.use_isolation
@@ -873,7 +895,10 @@ class PlaceNewsAction(pcbnew.ActionPlugin):
             f"Placement areas: {len(area_violations)} part(s) outside / intruding\n"
             f"Keep-out violations: {n_keepout}\n"
             f"Silkscreen: {n_silk_moved} refs repositioned\n"
-            f"Moves: {result.total_moves} total, {result.accepted_moves} accepted\n"
+            + (f"Ratsnest crossings: {result.untangle.crossings_before} -> "
+               f"{result.untangle.crossings_after} ({result.untangle.swaps} swaps, "
+               f"{result.untangle.flips} turned)\n" if getattr(result, 'untangle', None) else "")
+            + f"Moves: {result.total_moves} total, {result.accepted_moves} accepted\n"
             f"Time: {elapsed:.1f}s"
         )
 
@@ -905,9 +930,55 @@ class PlaceNewsAction(pcbnew.ActionPlugin):
             n_areas=len(verify_model.placement_areas),
             n_area_violations=len(area_violations),
             alignment=getattr(result, 'alignment', None),
+            untangle=getattr(result, 'untangle', None),
         )
         accepted = rdlg.ShowModal() == wx.ID_OK
         rdlg.Destroy()
 
         if not accepted:
             restore_original_positions(board, original_positions)
+        _learn_from_run(learner, board, policy_eps, accepted)
+
+
+def _apply_learned_policy(config):
+    """Set the tidy-up knobs from what was learned about the user's taste."""
+    try:
+        from .aesthetic_learning import Learner, PLACEMENT_KNOBS
+        learner = Learner()
+        values, eps = learner.sample(PLACEMENT_KNOBS)
+        if config.align_rows:
+            config.align_budget = values['align_budget']
+        else:
+            eps.pop('align_budget', None)
+        config.orient_parts = learner.orientation_enabled
+        if config.orient_parts:
+            config.orient_budget = values['orient_budget']
+        else:
+            eps.pop('orient_budget', None)
+        if config.untangle:
+            config.untangle_budget = values['untangle_budget']
+        else:
+            eps.pop('untangle_budget', None)
+        return learner, eps
+    except Exception:
+        return None, {}
+
+
+def _learn_from_run(learner, board, eps, accepted: bool) -> None:
+    """Remember the placement just produced (to learn from later edits); a
+    rejected result is a mild negative reward for the knobs tried."""
+    if learner is None:
+        return
+    try:
+        if not accepted:
+            learner._reinforce(eps, -0.3)
+            learner.save()
+            return
+        from .aesthetic_check import check, extract_geometry
+        from .aesthetic_learning import board_state
+        result = check(extract_geometry(board), learner.weights)
+        learner.record_run(str(board.GetFileName() or ''), 'placement', result.qualities,
+                           board_state(board), eps)
+        learner.save()
+    except Exception:
+        pass

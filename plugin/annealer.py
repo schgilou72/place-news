@@ -40,6 +40,11 @@ class SAConfig:
     num_starts: int = 1              # multi-start: total independent runs (1 = classic single-run)
 
     align_rows: bool = False         # tidy-up: same-type parts in rows / columns, even spacing
+    align_budget: float = 0.03       # share of wirelength the row tidy-up may spend
+    orient_parts: bool = False       # tidy-up: turn parts like their siblings first
+    orient_budget: float = 0.02
+    untangle: bool = False           # cost: swap / turn parts to uncross the ratsnest
+    untangle_budget: float = 0.02
 
     callback_interval: float = 0.33  # seconds between UI updates (~3/sec)
 
@@ -56,6 +61,7 @@ class SAResult:
     accepted_moves: int
     cost_history: List[Tuple[int, float]] = field(default_factory=list)
     alignment: Optional[object] = None      # aesthetics.AlignReport when align_rows
+    untangle: Optional[object] = None       # aesthetics.UntangleReport when untangle
 
 
 def auto_calibrate_t0(
@@ -676,11 +682,25 @@ def run_sa(
     total_moves += n_refined
 
     alignment = None
-    if config.align_rows:
-        from .aesthetics import align_rows
+    if config.align_rows or config.orient_parts:
+        from .aesthetics import AlignReport, align_rows, harmonize_orientation
         cost_state._compute_all()
-        alignment = align_rows(model, cost_state)
-        total_moves += alignment.parts_moved
+        turned = 0
+        if config.orient_parts:
+            turned = harmonize_orientation(model, cost_state, config.orient_budget)
+        if config.align_rows:
+            alignment = align_rows(model, cost_state, budget_ratio=config.align_budget)
+        else:
+            alignment = AlignReport(hpwl_before=cost_state.hpwl, hpwl_after=cost_state.hpwl)
+        alignment.rotated = turned
+        total_moves += alignment.parts_moved + turned
+
+    untangled = None
+    if config.untangle:
+        from .aesthetics import untangle
+        cost_state._compute_all()
+        untangled = untangle(model, cost_state, budget_ratio=config.untangle_budget)
+        total_moves += untangled.swaps + untangled.flips
 
     cost_state._compute_all()
     final_cost = cost_state.normalized_cost
@@ -735,6 +755,7 @@ def run_sa(
         accepted_moves=total_accepted,
         cost_history=cost_history,
         alignment=alignment,
+        untangle=untangled,
     )
 
 

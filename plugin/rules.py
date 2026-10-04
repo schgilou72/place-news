@@ -149,7 +149,7 @@ class PadInfo:
     groups: Tuple[str, ...] = ()
     pad_type: str = 'smd'                         # smd | tht | npth | conn (pads only)
     layers: Tuple[str, ...] = ('F.Cu',)           # copper layers; THT / vias -> ('*.Cu',)
-    kind: str = 'pad'                             # pad | track | via
+    kind: str = 'pad'                             # pad | track | via | zone
     fp_lib_id: str = ''                           # e.g. 'Package_TO_SOT_THT:TO-220-3_Vertical'
 
     @property
@@ -347,7 +347,7 @@ _ATTR_OF = {
     'memberOfGroup': ('groups',),
 }
 
-_TYPE_LABEL = {'pad': 'Pad', 'track': 'Track', 'via': 'Via'}
+_TYPE_LABEL = {'pad': 'Pad', 'track': 'Track', 'via': 'Via', 'zone': 'Zone'}
 
 
 class _Parser:

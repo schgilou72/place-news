@@ -38,19 +38,27 @@ def metadata(ver: str) -> dict:
     return {
         "$schema": "https://go.kicad.org/pcm/schemas/v1",
         "name": "place-news",
-        "description": "Component placement and Freerouting autorouting that respect "
-                       "clearance and creepage rules (power electronics, HV).",
+        "description": "Component placement, Freerouting autorouting and a ground pour that "
+                       "respect clearance and creepage rules (power electronics, HV), with "
+                       "an aesthetic and cost check that learns your taste.",
         "description_full": (
-            "place-news adds two actions to the PCB editor.\n\n"
+            "place-news adds three actions to the PCB editor.\n\n"
             "Placement: simulated annealing that minimises wirelength while keeping "
             "pads as far apart as the net-class clearances and the custom rules "
             "(clearance, creepage, physical_clearance in the .kicad_dru file) "
             "demand, and honouring rule areas (footprint/pad keep-outs, placement "
-            "areas by sheet, component class or group).\n\n"
+            "areas by sheet, component class or group). Then a tidy-up: same-type "
+            "parts in rows and columns, readable references, an untangled ratsnest "
+            "(fewer vias).\n\n"
             "Routing: Specctra round trip with Freerouting (Java 25+, Freerouting "
             "2.4+, not included). The isolation rules become Freerouting class "
-            "clearances, rule areas only block what they really forbid, and the "
-            "result is checked with KiCad's DRC.\n\n"
+            "clearances, rule areas only block what they really forbid; fewer vias, "
+            "a try on the two outer layers of multilayer boards, a ground pour on the "
+            "top layer that keeps the creepage distances, and a check with KiCad's "
+            "DRC.\n\n"
+            "Aesthetic check: placement, routing and cost criteria, numbered markers "
+            "and an HTML report, a layer-count estimate (routing room per net, BGA "
+            "escape), and learning from your opinion and your corrections.\n\n"
             "Derived from CadMust-Neo by Remi Blokker (MIT)."),
         "identifier": IDENTIFIER,
         "type": "plugin",
@@ -58,7 +66,7 @@ def metadata(ver: str) -> dict:
         "license": "MIT",
         "resources": {},
         "tags": ["placement", "autorouter", "freerouting", "creepage", "clearance",
-                 "power-electronics"],
+                 "power-electronics", "ground-plane", "design-check"],
         "versions": [{"version": ver, "status": "testing", "kicad_version": "10.0"}],
     }
 

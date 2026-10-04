@@ -24,6 +24,8 @@ def main():
 
     import plugin.place_news_action as act
     import plugin.settings_dialog as sd
+    import plugin.aesthetic_learning as al
+    al.default_store_path = lambda: os.path.join(workdir, 'learning.json')
 
     pcbnew.GetBoard = lambda: board
     pcbnew.Refresh = lambda: None

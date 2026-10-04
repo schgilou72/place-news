@@ -25,16 +25,21 @@ def main():
     board, path, _model = place_board(workdir)
 
     import plugin.route_action as ra
+    import plugin.aesthetic_learning as al
     from plugin import specctra
+    al.default_store_path = lambda: os.path.join(workdir, 'learning.json')
 
     jar = os.environ.get('PLACE_NEWS_FREEROUTING_JAR') or specctra.find_freerouting_jar()
     pcbnew.GetBoard = lambda: board
     seen = {}
 
     def route_modal(self):
-        seen['dialog'] = True
+        seen['dialog'] = [c.GetLabel() for c in self.GetChildren()
+                          if isinstance(c, (wx.StaticText, wx.CheckBox))]
+        seen['values'] = None
         if jar:
             self._jar.SetPath(jar)
+        seen['values'] = self.values
         return wx.ID_OK
 
     def result_modal(self):
@@ -48,7 +53,10 @@ def main():
     tracks_before = len(board.GetTracks())
     ra.PlaceNewsRouteAction().Run()
     pcbnew.SaveBoard(path, board, True)
-    print('route dialog shown:', seen.get('dialog'))
+    print('route dialog:')
+    for label in seen.get('dialog') or []:
+        print('   ', label.replace('\n', ' / ')[:200])
+    print('values:', {k: v for k, v in (seen.get('values') or {}).items() if k not in ('jar', 'java')})
     print('tracks: before', tracks_before, 'after', len(board.GetTracks()))
     print('result dialog:')
     print(seen.get('result', '(none)'))

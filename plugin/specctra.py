@@ -675,6 +675,25 @@ def export_dsn(board, dsn_path: str, use_isolation: bool = True) -> ExportReport
     return ExportReport(dsn=dsn_path, keepouts=keepouts, classes=classes, rules=rules)
 
 
+def outer_layers_only(src: str, dst: str) -> List[str]:
+    """Write a copy of a DSN file whose inner copper layers are planes
+    ('power' layers, which Freerouting does not route on): a trial on the two
+    outer layers. Planes exported on them still connect their nets. Returns
+    the names of the inner layers (empty for a two-layer board)."""
+    with open(src, 'r', encoding='utf-8') as f:
+        tree = parse_dsn(f.read())
+    structure = _find(tree, 'structure')
+    layers = _find_all(structure, 'layer') if structure is not None else []
+    inner = layers[1:-1]
+    for layer in inner:
+        kind = _find(layer, 'type')
+        if kind is not None and len(kind) > 1:
+            kind[1] = 'power'
+    with open(dst, 'w', encoding='utf-8') as f:
+        f.write(write_dsn(tree))
+    return [str(layer[1]) for layer in inner]
+
+
 @dataclass
 class RouteResult:
     ok: bool
@@ -687,12 +706,12 @@ class RouteResult:
     timed_out: bool = False
 
 
-_SCORE_RE = re.compile(r'\((\d+) unrouted and (\d+) violations\)')
+_SCORE_RE = re.compile(r'\((\d+) unrouted and (\d+) violations?\)')
 
 
 def run_freerouting(java: str, jar: str, dsn: str, ses: str, passes: int = 20,
                     threads: int = 0, poll: Optional[Callable[[str, float], bool]] = None,
-                    timeout_s: float = 3600.0) -> RouteResult:
+                    timeout_s: float = 3600.0, via_cost: Optional[int] = None) -> RouteResult:
     """Run Freerouting headless. `poll(last_line, elapsed)` is called about
     ten times a second; return False to cancel."""
     cmd = [java, '-jar', jar, '-de', dsn, '-do', ses, '-mp', str(max(1, passes))]
@@ -705,6 +724,8 @@ def run_freerouting(java: str, jar: str, dsn: str, ses: str, passes: int = 20,
     # clearance, which would defeat the isolation rules. (Older versions
     # ignore this setting with a warning.)
     cmd += ['--router.fanout.fallback_to_board_vias=false']
+    if via_cost:
+        cmd += [f'--router.scoring.via_costs={int(via_cost)}']
     if os.path.exists(ses):
         os.remove(ses)
     log: List[str] = []

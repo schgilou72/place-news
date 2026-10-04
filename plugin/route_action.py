@@ -12,8 +12,9 @@ import json
 import os
 import shutil
 import tempfile
+import textwrap
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pcbnew
 import wx
@@ -29,7 +30,17 @@ _DEFAULTS: Dict[str, Any] = {
     'passes': 30,
     'use_isolation': True,
     'check_drc': True,
+    'fewer_vias': True,
+    'outer_first': True,
+    'pour': True,
+    'pour_net': '',
 }
+
+BASE_VIA_COST = 50          # Freerouting's default
+# 'Fewer vias': via cost 150. Tried on boards: flyback 6 -> 4-5 vias for the
+# same length; a dense board (interf_u) 46 -> 34 vias but 3 -> 5 connections
+# left, so a run that leaves connections is routed again at the usual cost.
+FEWER_VIAS_FACTOR = 3
 
 FREEROUTING_URL = 'https://github.com/freerouting/freerouting/releases'
 JAVA_URL = 'https://adoptium.net/temurin/releases/'
@@ -89,7 +100,9 @@ def _board_name(board) -> str:
 
 class RouteDialog(wx.Dialog):
     def __init__(self, parent, board, settings: Dict[str, Any],
-                 preview: Optional[specctra.ExportReport], preview_error: str = ''):
+                 preview: Optional[specctra.ExportReport], preview_error: str = '',
+                 room=None, pour_nets: Sequence[str] = (), pour_default: str = '',
+                 copper: int = 2):
         super().__init__(parent, title='place-news — Route with Freerouting',
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self._settings = dict(settings)
@@ -168,6 +181,57 @@ class RouteDialog(wx.Dialog):
         rbox.Add(self._chk_drc, 0, wx.ALL, 5)
         main.Add(rbox, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 8)
 
+        # --- Cost ---
+        cbox = wx.StaticBoxSizer(wx.StaticBox(self, label='Cost'), wx.VERTICAL)
+        self._chk_vias = wx.CheckBox(self, label=f'Fewer vias (via cost x{FEWER_VIAS_FACTOR})')
+        self._chk_vias.SetValue(bool(self._settings.get('fewer_vias', True)))
+        self._chk_vias.SetToolTip(
+            'Freerouting weighs each via against track length. A higher via cost\n'
+            'gives fewer vias for about the same length. On a dense board it can\n'
+            'leave connections unrouted: the board is then routed again at the\n'
+            'usual cost and the more complete result is kept. The aesthetic check\n'
+            'learns from your feedback how far to go.')
+        cbox.Add(self._chk_vias, 0, wx.ALL, 5)
+        self._chk_outer = None
+        if copper > 2:
+            self._chk_outer = wx.CheckBox(
+                self, label=f'Try the 2 outer layers first (fewer layers; the board has {copper})')
+            self._chk_outer.SetValue(bool(self._settings.get('outer_first', True)))
+            self._chk_outer.SetToolTip(
+                'Freerouting first routes on F.Cu and B.Cu only (inner layers stay\n'
+                'planes). If every connection is made, that result is kept and the\n'
+                'inner layers can be dropped unless they are planes; otherwise the\n'
+                'board is routed again on all its layers.')
+            cbox.Add(self._chk_outer, 0, wx.ALL, 5)
+        if room is not None:
+            lbl_room = wx.StaticText(self, label=textwrap.fill(room.describe(), 92))
+            lbl_room.SetForegroundColour(grey)
+            cbox.Add(lbl_room, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        main.Add(cbox, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
+
+        # --- Ground plane ---
+        pbox = wx.StaticBoxSizer(wx.StaticBox(self, label='Ground plane'), wx.VERTICAL)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self._pour_nets = list(pour_nets)
+        self._chk_pour = wx.CheckBox(self, label='Pour on the top layer (F.Cu), net:')
+        self._pour_net = wx.Choice(self, choices=self._pour_nets)
+        saved = str(self._settings.get('pour_net', '') or '')
+        chosen = saved if saved in self._pour_nets else pour_default
+        if chosen in self._pour_nets:
+            self._pour_net.SetSelection(self._pour_nets.index(chosen))
+        self._chk_pour.SetValue(bool(self._settings.get('pour', True)) and bool(chosen))
+        self._chk_pour.Enable(bool(self._pour_nets))
+        tip = ('After routing, the net is poured over the whole top layer. Copper that\n'
+               'needs more than the clearance from it (creepage, physical clearance of\n'
+               'the custom rules) is kept clear by that distance, with one clean outline\n'
+               'per group (a primary side, say). Running again replaces the pour.')
+        self._chk_pour.SetToolTip(tip)
+        self._pour_net.SetToolTip(tip)
+        row.Add(self._chk_pour, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        row.Add(self._pour_net, 0, wx.ALIGN_CENTER_VERTICAL)
+        pbox.Add(row, 0, wx.ALL, 5)
+        main.Add(pbox, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
+
         note = wx.StaticText(self, label=(
             'Unlocked tracks are replaced by the router\'s result (existing ones are kept\n'
             'as a starting point; lock tracks to protect them). Edit > Undo reverts.'))
@@ -206,8 +270,14 @@ class RouteDialog(wx.Dialog):
 
     @property
     def values(self) -> Dict[str, Any]:
+        sel = self._pour_net.GetSelection()
+        net = self._pour_nets[sel] if 0 <= sel < len(self._pour_nets) else ''
         return {'jar': self.jar, 'java': self.java, 'passes': int(self._passes.GetValue()),
-                'use_isolation': self._chk_iso.GetValue(), 'check_drc': self._chk_drc.GetValue()}
+                'use_isolation': self._chk_iso.GetValue(), 'check_drc': self._chk_drc.GetValue(),
+                'fewer_vias': self._chk_vias.GetValue(),
+                'outer_first': bool(self._chk_outer.GetValue()) if self._chk_outer else
+                self._settings.get('outer_first', True),
+                'pour': self._chk_pour.GetValue() and bool(net), 'pour_net': net}
 
 
 class RouteResultDialog(wx.Dialog):
@@ -261,15 +331,29 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
         ses = os.path.join(workdir, name + '.ses')
 
         preview, preview_error = None, ''
+        room, pour_nets, pour_default = None, [], ''
+        copper = int(board.GetCopperLayerCount())
         busy = wx.BusyInfo('Reading the board and its design rules...')
         try:
             preview = specctra.export_dsn(board, dsn, use_isolation=True)
         except Exception as e:      # shown in the dialog
             preview_error = str(e)
         finally:
+            try:
+                from .aesthetic_check import estimate_layers, extract_geometry
+                room = estimate_layers(extract_geometry(board))
+            except Exception:
+                room = None
+            try:
+                from .pour import default_pour_net, pour_net_candidates
+                pour_nets = pour_net_candidates(board)
+                pour_default = default_pour_net(board)
+            except Exception:
+                pour_nets, pour_default = [], ''
             del busy
 
-        dlg = RouteDialog(None, board, settings, preview, preview_error)
+        dlg = RouteDialog(None, board, settings, preview, preview_error, room=room,
+                          pour_nets=pour_nets, pour_default=pour_default, copper=copper)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
             return False
@@ -278,10 +362,17 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
         settings.update(values)
         save_route_settings(settings)
 
+        # A previous place-news pour is left out of the routing when a new one
+        # will be made: exported as a plane, it would let Freerouting skip the
+        # tracks of its net.
+        from .pour import count_pours, export_dsn_without_pours
+        old_pours = count_pours(board)
         export = preview
-        if export is None or not values['use_isolation']:
+        if export is None or not values['use_isolation'] or (values['pour'] and old_pours):
             try:
-                export = specctra.export_dsn(board, dsn, use_isolation=values['use_isolation'])
+                export = (export_dsn_without_pours(board, dsn, values['use_isolation'])
+                          if values['pour'] else
+                          specctra.export_dsn(board, dsn, use_isolation=values['use_isolation']))
             except Exception as e:
                 wx.MessageBox(f'Specctra export failed:\n{e}', 'place-news', wx.OK | wx.ICON_ERROR)
                 return False
@@ -289,15 +380,75 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
         progress = wx.ProgressDialog(
             'place-news \u2014 Routing', 'Starting Freerouting...', maximum=100, parent=None,
             style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT | wx.PD_ELAPSED_TIME | wx.PD_SMOOTH)
+        stage = ['']
 
         def poll(line: str, _elapsed: float) -> bool:
-            cont, _skip = progress.Pulse(progress_text(line))
+            cont, _skip = progress.Pulse(stage[0] + progress_text(line))
             return bool(cont)
 
+        # Via cost: Freerouting's default, or "fewer vias" tuned by what was learned.
+        learner, eps = None, {}
+        via_cost = BASE_VIA_COST * (FEWER_VIAS_FACTOR if values['fewer_vias'] else 1)
+        try:
+            from .aesthetic_learning import Learner, ROUTING_KNOBS
+            learner = Learner()
+            if values['fewer_vias']:
+                knobs, eps = learner.sample(ROUTING_KNOBS)
+                via_cost = max(BASE_VIA_COST,
+                               int(round(BASE_VIA_COST * FEWER_VIAS_FACTOR * knobs['via_cost'])))
+        except Exception:
+            learner = None
+        costs = [via_cost] + ([BASE_VIA_COST] if via_cost > BASE_VIA_COST else [])
+
+        # Fewer layers: a first try on the two outer layers only.
+        plans = [('all', dsn)]
+        inner_layers: List[str] = []
+        if copper > 2 and values['outer_first']:
+            outer_dsn = os.path.join(workdir, name + '-outer.dsn')
+            try:
+                inner_layers = specctra.outer_layers_only(dsn, outer_dsn)
+                plans.insert(0, ('outer', outer_dsn))
+            except Exception:
+                inner_layers = []
+
+        def complete(r) -> bool:
+            return bool(r.ok and r.unrouted == 0)
+
+        def unrouted(r) -> int:
+            return r.unrouted if (r.ok and r.unrouted is not None) else 1 << 30
+
+        runs: List[Tuple[str, int, Any]] = []
+        chosen = outer_best = None
+        chosen_kind = ''
         start = time.time()
         try:
-            result = specctra.run_freerouting(values['java'], values['jar'], dsn, ses,
-                                              passes=values['passes'], poll=poll)
+            for kind, path in plans:
+                best = None
+                for cost in costs:
+                    stage[0] = ('Outer layers only' if kind == 'outer' else
+                                'All layers' if len(plans) > 1 else '')
+                    if cost != costs[0]:
+                        stage[0] += (', ' if stage[0] else '') + 'usual via cost'
+                    stage[0] += ': ' if stage[0] else ''
+                    out_ses = os.path.join(workdir, f'{name}-{kind}-{cost}.ses')
+                    r = specctra.run_freerouting(values['java'], values['jar'], path, out_ses,
+                                                 passes=values['passes'], poll=poll,
+                                                 via_cost=cost)
+                    runs.append((kind, cost, r))
+                    if r.cancelled or r.timed_out:
+                        best = (r, cost, out_ses)
+                        break
+                    if best is None or unrouted(r) < unrouted(best[0]):
+                        best = (r, cost, out_ses)
+                    if complete(r):
+                        break                   # fewer vias did not cost a connection
+                chosen, chosen_kind = best, kind
+                if best[0].cancelled or best[0].timed_out:
+                    break
+                if kind == 'outer':
+                    outer_best = best
+                    if complete(best[0]):
+                        break                   # two layers are enough
         except Exception as e:
             wx.MessageBox(f'Freerouting could not be started:\n{e}', 'place-news',
                           wx.OK | wx.ICON_ERROR)
@@ -305,6 +456,7 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
         finally:
             progress.Destroy()
         elapsed = time.time() - start
+        result, via_used, ses = chosen
 
         if result.timed_out:
             wx.MessageBox('Freerouting did not finish within the time limit; the board was not '
@@ -329,7 +481,20 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
                           f'Edit > Undo restores the previous tracks.\nWorking files: {workdir}',
                           'place-news', wx.OK | wx.ICON_ERROR)
             return True
-        if refill:
+        pour_report = None
+        if values['pour'] and values['pour_net']:
+            busy = wx.BusyInfo(f"Pouring {values['pour_net']} on the top layer...")
+            try:
+                from .pour import add_pour
+                pour_report = add_pour(board, values['pour_net'], 'F.Cu', fill=True)
+            except Exception as e:
+                from .pour import PourReport
+                pour_report = PourReport(net=values['pour_net'], error=str(e))
+            finally:
+                del busy
+        if pour_report is not None and pour_report.filled:
+            refill = True                       # the pour filled every zone
+        elif refill:
             try:
                 pcbnew.ZONE_FILLER(board).Fill(board.Zones())
             except Exception:
@@ -346,8 +511,56 @@ class PlaceNewsRouteAction(pcbnew.ActionPlugin):
             finally:
                 del busy
 
+        if learner is not None:
+            try:
+                from .aesthetic_check import check, extract_geometry
+                from .aesthetic_learning import board_state
+                if via_used != via_cost and eps:
+                    learner._reinforce(eps, -0.5)      # that via cost cost connections
+                    eps = {}
+                checked = check(extract_geometry(board), learner.weights)
+                learner.record_run(str(board.GetFileName() or ''), 'routing', checked.qualities,
+                                   board_state(board), eps)
+                learner.save()
+            except Exception:
+                pass
+
+        notes: List[str] = ['Cost:']
+        if outer_best is not None:
+            if complete(outer_best[0]):
+                notes.append(f'  Routed on the 2 outer layers only: {", ".join(inner_layers)} '
+                             f'carry no track. Unless they are planes, the board can be made '
+                             f'in 2 layers (Board Setup > Board Stackup).')
+            else:
+                left = outer_best[0].unrouted if outer_best[0].unrouted is not None else '?'
+                notes.append(f'  The 2 outer layers were not enough ({left} connections left): '
+                             f'routed on all {copper} layers.')
+        first = next((r for k, c, r in runs if k == chosen_kind and c == via_cost), None)
+        if via_used != via_cost:
+            left = first.unrouted if first is not None and first.unrouted is not None else '?'
+            notes.append(f'  Via cost {via_cost} ("fewer vias") left {left} connection(s) '
+                         f'unrouted; the usual cost ({BASE_VIA_COST}) did better: that result is kept.')
+        elif values['fewer_vias']:
+            notes.append(f'  Freerouting via cost: {via_used} (default {BASE_VIA_COST}; '
+                         f'"fewer vias" x{FEWER_VIAS_FACTOR}, tuned from your feedback).')
+        else:
+            notes.append(f'  Freerouting via cost: {via_used} (its default).')
+        if old_pours and not values['pour']:
+            notes.append('  The previous place-news pour was kept and refilled; its isolation '
+                         'cut-outs follow the previous tracks: route with the pour option to '
+                         'renew it.')
+        try:
+            n_vias = sum(1 for t in board.GetTracks() if t.GetClass() == 'PCB_VIA')
+            notes.append(f'  Vias: {n_vias}.')
+        except Exception:
+            pass
+        if room is not None:
+            notes += ['  ' + line for line in textwrap.wrap(room.describe(), 96)]
+        if pour_report is not None:
+            notes.append('Ground plane:')
+            notes += ['  ' + line for line in pour_report.describe()]
         lines = summarize_result(result, export, drc, elapsed, values['check_drc'],
-                                 zones_refilled=refill)
+                                 zones_refilled=refill, notes=notes)
         dlg = RouteResultDialog(None, lines)
         dlg.ShowModal()
         dlg.Destroy()

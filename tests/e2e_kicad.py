@@ -227,13 +227,16 @@ def build_board(workdir, seed=1):
     return board, path
 
 
-def run_drc(path):
+def run_drc(path, with_unconnected=False):
     out = path + '.drc.json'
     subprocess.run([KICAD_CLI, 'pcb', 'drc', '--format', 'json', '--units', 'mm',
                     '--severity-all', '-o', out, path],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with open(out) as f:
-        return json.load(f)['violations']
+        data = json.load(f)
+    if with_unconnected:
+        return data['violations'], data.get('unconnected_items', [])
+    return data['violations']
 
 
 def same_footprint(v):
@@ -255,7 +258,8 @@ def place_board(workdir):
     random.seed(11)
     board, path = build_board(workdir)
     model = extract_board_model(board)
-    run_sa(model, SAConfig(max_iterations=120, reheat_count=2, align_rows=True))
+    model.sa_result = run_sa(model, SAConfig(max_iterations=120, reheat_count=2, align_rows=True,
+                                             untangle=True))
     apply_model_to_board(board, model)
     verify = extract_board_model(board)
     silk = extract_silkscreen_model(board, verify)
@@ -308,6 +312,11 @@ class TestEndToEnd(unittest.TestCase):
         board, path, model = place_board(workdir)
         cs = CostState(model, quiet=True)
         self.assertEqual(cs.area_violations(), [])
+        untangled = model.sa_result.untangle
+        self.assertIsNotNone(untangled)
+        self.assertLessEqual(untangled.crossings_after, untangled.crossings_before)
+        print(f'\nRatsnest crossings: {untangled.crossings_before} -> {untangled.crossings_after} '
+              f'({untangled.swaps} swaps, {untangled.flips} turned)')
         self.assertAlmostEqual(cs._keepout_penalty, 0.0, delta=1.0)
         self.assertEqual(list_violations(model.isolation, model.footprints), [])
 
@@ -360,6 +369,94 @@ class TestEndToEnd(unittest.TestCase):
         # Blocked rule areas used to leave 5+ connections unrouted on this board.
         self.assertIsNotNone(result.unrouted)
         self.assertLessEqual(result.unrouted, 1)
+
+        # Ground plane on the top layer: the HV side keeps its 6 mm of creepage,
+        # also from an HV copper zone (the zone filler alone would keep 2 mm).
+        from plugin import pour
+        hv_pad = next(p for fp in board.GetFootprints() for p in fp.Pads()
+                      if str(p.GetNetname()) == 'HV_BUS+' and p.IsOnLayer(pcbnew.F_Cu))
+        c = hv_pad.GetPosition()
+        hv = pcbnew.ZONE(board)
+        hv.SetLayer(pcbnew.F_Cu)
+        hv.SetNetCode(hv_pad.GetNetCode())
+        hv.SetZoneName('HV copper')
+        ol = hv.Outline()
+        ol.NewOutline()
+        for dx, dy in ((-2, -2), (2, -2), (2, 2), (-2, 2)):
+            ol.Append(c.x + pcbnew.FromMM(dx), c.y + pcbnew.FromMM(dy))
+        board.Add(hv)
+        net = pour.default_pour_net(board)
+        self.assertEqual(net, 'GND')
+        made = pour.add_pour(board, net, 'F.Cu')
+        self.assertEqual(made.error, '')
+        self.assertTrue(made.filled)
+        self.assertGreater(made.cutouts, 10)
+        self.assertEqual(made.widest, 6_000_000)
+        poured = [z for z in board.Zones() if str(z.GetZoneName()) == pour.POUR_NAME]
+        self.assertTrue(poured and all(z.IsFilled() for z in poured))
+        self.assertGreater(sum(z.CalculateFilledArea() for z in poured), 1000 * 1e12)   # > 1000 mm²
+        # Running again replaces the pour.
+        again = pour.add_pour(board, net, 'F.Cu')
+        self.assertEqual(again.replaced, len(poured))
+        # Routing again: the old pour must not reach Freerouting as a GND plane
+        # (it would skip the GND tracks), and the board keeps it meanwhile.
+        dsn2 = os.path.join(workdir, 'again.dsn')
+        specctra.export_dsn(board, dsn2, use_isolation=True)
+        with open(dsn2) as f:
+            self.assertIn('(plane GND', f.read())
+        pour.export_dsn_without_pours(board, dsn2, use_isolation=True)
+        with open(dsn2) as f:
+            self.assertNotIn('(plane GND', f.read())
+        self.assertEqual(pour.count_pours(board), len(poured))
+        pcbnew.SaveBoard(path, board, True)
+        violations, unconnected = run_drc(path, with_unconnected=True)
+        print('KiCad DRC with the GND pour:',
+              {t: sum(1 for v in violations if v['type'] == t) for t in {v['type'] for v in violations}},
+              '| unconnected:', len(unconnected))
+        self.assertEqual(isolation_violations(violations), [])
+        self.assertLessEqual(len(unconnected), result.unrouted)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_layer_estimate_and_outer_layers_trial(self):
+        from plugin import specctra
+        from plugin.aesthetic_check import estimate_layers, extract_geometry
+        workdir = tempfile.mkdtemp(prefix='place-news-layers-')
+        board, path, _model = place_board(workdir)
+        est = estimate_layers(extract_geometry(board))
+        self.assertEqual(est.layers, 2)
+        self.assertLessEqual(est.needed_layers, 2)        # 1 when the ratsnest is planar
+        self.assertEqual(est.suggested_layers, 2)
+        self.assertGreater(est.ratio, 2.0)            # a roomy power board
+        dsn = os.path.join(workdir, 'smps.dsn')
+        specctra.export_dsn(board, dsn, use_isolation=True)
+        # Two layers: nothing to take away.
+        self.assertEqual(specctra.outer_layers_only(dsn, dsn + '.outer'), [])
+
+        # The same board in 4 layers: the estimate says 2 should do, and the
+        # trial on the outer layers routes everything without the inner ones.
+        board.SetCopperLayerCount(4)
+        enabled = board.GetEnabledLayers()
+        enabled.AddLayerSet(pcbnew.LSET.AllCuMask(4))
+        board.SetEnabledLayers(enabled)
+        est4 = estimate_layers(extract_geometry(board))
+        self.assertEqual(est4.layers, 4)
+        self.assertEqual(est4.suggested_layers, 2)
+        self.assertIn('2 routing layers should do', est4.verdict())
+        tools = _freerouting()
+        if not tools:
+            self.skipTest('needs Java 25+ and a Freerouting jar (PLACE_NEWS_FREEROUTING_JAR)')
+        java, jar = tools
+        specctra.export_dsn(board, dsn, use_isolation=True)
+        outer = dsn + '.outer.dsn'
+        self.assertEqual(specctra.outer_layers_only(dsn, outer), ['In1.Cu', 'In2.Cu'])
+        ses = os.path.join(workdir, 'smps.ses')
+        result = specctra.run_freerouting(java, jar, outer, ses, passes=10)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.unrouted, 0)
+        self.assertTrue(specctra.import_ses(board, ses))
+        layers = {board.GetLayerName(t.GetLayer()) for t in board.GetTracks()
+                  if t.GetClass() != 'PCB_VIA'}
+        self.assertTrue(layers and layers <= {'F.Cu', 'B.Cu'}, layers)
         shutil.rmtree(workdir, ignore_errors=True)
 
 

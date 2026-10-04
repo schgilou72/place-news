@@ -398,17 +398,19 @@ def _component_classes(fp) -> Tuple[str, ...]:
     return tuple(c.strip() for c in s.split(',') if c.strip())
 
 
-class _NetClassClearance:
-    """Effective clearance of a (possibly composite) net class, KiCad-style:
-    the highest-priority constituent that defines a clearance wins."""
+class _NetClassValue:
+    """Effective value (clearance, track width...) of a (possibly composite)
+    net class, KiCad-style: the highest-priority constituent that defines
+    the value wins."""
 
-    def __init__(self, board):
+    def __init__(self, board, what: str = 'Clearance'):
+        self._what = what
         self._cache: Dict[Tuple[str, ...], int] = {}
         self._ns = None
         self._default = 0
         try:
             self._ns = board.GetDesignSettings().m_NetSettings
-            self._default = int(self._ns.GetDefaultNetclass().GetClearance())
+            self._default = int(getattr(self._ns.GetDefaultNetclass(), 'Get' + what)())
         except Exception:
             self._ns = None
 
@@ -426,16 +428,22 @@ class _NetClassClearance:
                 if nc is None:
                     continue
                 prio = nc.GetPriority() if hasattr(nc, 'GetPriority') else 0
-                has = nc.HasClearance() if hasattr(nc, 'HasClearance') else True
-                cands.append((prio, has, int(nc.GetClearance()) if has else 0))
-            for _prio, has, clr in sorted(cands, key=lambda t: t[0]):
+                has_fn = getattr(nc, 'Has' + self._what, None)
+                has = has_fn() if has_fn is not None else True
+                cands.append((prio, has, int(getattr(nc, 'Get' + self._what)()) if has else 0))
+            for _prio, has, val in sorted(cands, key=lambda t: t[0]):
                 if has:
-                    best = clr
+                    best = val
                     break
         if best is None:
             best = self._default
         self._cache[names] = best
         return best
+
+
+class _NetClassClearance(_NetClassValue):
+    def __init__(self, board):
+        super().__init__(board, 'Clearance')
 
 
 def _board_outline_polygon(board, pcbnew) -> Optional[List[Tuple[int, int]]]:

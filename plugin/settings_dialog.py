@@ -47,6 +47,7 @@ _DEFAULTS: Dict[str, Any] = {
     "use_isolation": True,
     "exclusive_areas": True,
     "align_rows": True,
+    "untangle": True,
 }
 
 
@@ -189,6 +190,15 @@ class SettingsDialog(wx.Dialog):
             "References are then centred on their parts, horizontal or reading\n"
             "bottom to top, and kept off the pads.")
         main_sizer.Add(self._chk_align, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        self._chk_untangle = wx.CheckBox(
+            self, label="Reduce cost: untangle the ratsnest (fewer vias)")
+        self._chk_untangle.SetToolTip(
+            "Every crossing of two ratsnest lines tends to cost a via. After the\n"
+            "tidy-up, identical parts swap places and two-pad parts turn round\n"
+            "(180°) when that removes crossings. Rows, columns and orientation\n"
+            "axes are kept; same safeguards as above (rules, 2 % of wirelength).\n"
+            "Power nets are left out: they usually go to a plane or a pour.")
+        main_sizer.Add(self._chk_untangle, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         # --- Design rules: isolation, placement areas ---
         bi = self._board_info or {}
@@ -475,6 +485,7 @@ class SettingsDialog(wx.Dialog):
         self._chk_isolation.SetValue(bool(s.get("use_isolation", True)))
         self._chk_exclusive.SetValue(bool(s.get("exclusive_areas", True)))
         self._chk_align.SetValue(bool(s.get("align_rows", True)))
+        self._chk_untangle.SetValue(bool(s.get("untangle", True)))
 
     def _on_preset_change(self, evt):
         """When preset changes in Expert mode, update the parameter controls."""
@@ -582,6 +593,7 @@ class SettingsDialog(wx.Dialog):
             config.penalty_scale_min = self._spin_penalty_scale.GetValue()
             config.num_starts = self._spin_num_starts.GetValue()
         config.align_rows = self._chk_align.GetValue()
+        config.untangle = self._chk_untangle.GetValue()
         return config
 
     def _on_ok(self, evt):
@@ -602,6 +614,7 @@ class SettingsDialog(wx.Dialog):
             "use_isolation": self._chk_isolation.GetValue(),
             "exclusive_areas": self._chk_exclusive.GetValue(),
             "align_rows": self._chk_align.GetValue(),
+            "untangle": self._chk_untangle.GetValue(),
         }
         save_settings(data)
         self.EndModal(wx.ID_OK)
