@@ -45,12 +45,15 @@ by Remi Blokker (MIT licence).
 
 ## Installation
 
+Download the archive from the
+[Releases](https://github.com/schgilou72/place-news/releases) page.
+
 **Plugin and Content Manager (recommended):** in KiCad, *Plugin and Content
 Manager → Install from File…* and choose `place-news-<version>-pcm.zip`.
 
 **Manual:** in the PCB editor, *Tools → External Plugins → Open Plugin
-Directory*, copy the `plugin/` folder there as `place_news/`, then *Tools →
-External Plugins → Refresh Plugins*.
+Directory*, unzip `place-news-<version>-plugin.zip` there (it holds the
+`place_news/` folder), then *Tools → External Plugins → Refresh Plugins*.
 
 Four toolbar buttons appear: placement (green grid), routing (trace with a
 dashed isolation line), the aesthetic check (magnifier) and sourcing (cart).

@@ -75,7 +75,7 @@ def metadata(ver: str) -> dict:
         "type": "plugin",
         "author": {"name": "Gilles Schweitzer", "contact": {}},
         "license": "MIT",
-        "resources": {},
+        "resources": {"homepage": "https://github.com/schgilou72/place-news"},
         "tags": ["placement", "autorouter", "freerouting", "creepage", "clearance",
                  "power-electronics", "ground-plane", "design-check", "bom", "sourcing"],
         "versions": [{"version": ver, "status": "testing", "kicad_version": "10.0"}],
